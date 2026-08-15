@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "codexVersion": "codex-cli 0.147.0",
+  "experimental": true,
+  "sourceAggregateSha256": "e0e83a5379d87b58746426d7d7f53dafc151ec40910a1f3e7c9f2b838b663e2a",
+  "sourceFiles": {
+    "JSONRPCMessage.json": "6da4cc373a7ccd01f5608ad4496eeb4d44b6a9b0d3158e85ed66b59f3c0b5114",
+    "ClientRequest.json": "929a5688c54f9beb6086a703b7fd2980f34d5fee17e3944a01e9eb3219eee10d",
+    "ServerRequest.json": "41187d1422afe9890b528749d13c497fbfecb8cb1ae6dd3de1a2a82d7b4ba687",
+    "ServerNotification.json": "6bf58bdb9d277419148878ea29804231b86b3d3d785076497204c329eabab3bb"
+  },
+  "methodCounts": {
+    "clientRequests": 133,
+    "serverRequests": 11,
+    "serverNotifications": 70
+  },
+  "outputs": {
+    "protocol-descriptor.js": "6deab5c7e66895ca1ab0374007d5d4ed3a24acdcfb9413b9a810f6e0e990ceb2",
+    "protocol.schema.json": "1321400ef0faaeb24c57edbe93d892358e2b81cd0ae233fa0baeb32e49392f38"
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "gate": "PASS",
+  "checkout": {
+    "headRef": "refs/heads/personal",
+    "headSha": "75bd5ac6ab7ef3b99932a5e910410cf9b958f8a9"
+  },
+  "versions": {
+    "codex": "codex-cli 0.147.0",
+    "node": "v26.7.0",
+    "bun": "1.3.14"
+  },
+  "codexExecutableSha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+  "schemas": {
+    "typescript": {
+      "fileCount": 723,
+      "sha256": "81515e7bbee62a6eea19a5a686a1a2d9c310ea0c5124e6b7eba4fc46c71d83a1"
+    },
+    "json": {
+      "fileCount": 361,
+      "sha256": "e0e83a5379d87b58746426d7d7f53dafc151ec40910a1f3e7c9f2b838b663e2a"
+    },
+    "experimental": true
+  },
+  "flow": {
+    "initialize": true,
+    "threadStart": true,
+    "firstTurnCompleted": true,
+    "streamingText": true,
+    "threadResume": true,
+    "secondTurnCompleted": true
+  },
+  "approval": {
+    "observed": true,
+    "requests": [
+      {
+        "method": "item/commandExecution/requestApproval",
+        "decision": "accept"
+      }
+    ]
+  },
+  "interrupt": {
+    "observed": true,
+    "terminalStatus": "interrupted"
+  },
+  "process": {
+    "instances": 2,
+    "exits": [
+      {
+        "code": 0,
+        "signal": null,
+        "stderrBytes": 332
+      },
+      {
+        "code": 0,
+        "signal": null,
+        "stderrBytes": 582
+      }
+    ],
+    "liveAfterCleanup": false
+  },
+  "cleanup": {
+    "approvalProbeRemoved": true,
+    "schemaWorkingDirectoriesRemoved": true,
+    "appServerProcessesExited": true
+  },
+  "pr884": {
+    "confirmed": [
+      "direct stdio app-server spawn",
+      "initialize then initialized",
+      "thread/start",
+      "turn/start",
+      "thread/resume",
+      "turn/interrupt",
+      "accept/decline approval decisions"
+    ],
+    "incompatible": [
+      "turn/aborted is replaced by turn/completed with interrupted status",
+      "raw JSON-RPC logging is unsafe",
+      "malformed JSONL cannot be ignored",
+      "binding writes require atomic mode-0600 persistence and corruption handling",
+      "backend availability cannot be hard-coded",
+      "process exit cannot be projected as idle success"
+    ]
+  }
+}
