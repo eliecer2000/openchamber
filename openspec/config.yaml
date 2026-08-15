@@ -1,0 +1,141 @@
+schema: spec-driven
+project: openchamber
+
+execution:
+  mode: interactive
+
+artifact_store:
+  mode: both
+  sdd_mode: hybrid
+
+delivery:
+  strategy: auto-chain
+  review_budget_lines: 800
+
+strict_tdd: true
+
+paths:
+  changes: openspec/changes/{change-name}
+  archive: openspec/changes/archive/YYYY-MM-DD-{change-name}
+  specs: openspec/specs/{domain}/spec.md
+
+context: |
+  Stack: Bun 1.3.14 workspace monorepo; Node.js >=22; TypeScript 5.9, React 19, Vite 7.
+  Runtimes: shared UI, web/server/CLI, Electron, VS Code, Capacitor mobile, and non-workspace MDX docs.
+  Languages: UI/client TS/TSX; web server/CLI and Electron JS/MJS; VS Code TS/TSX with JS tests; mobile TS config plus MJS scripts.
+  Tests: isolated Bun/node:test suites plus Vitest in web; Supertest integration coverage; no general E2E harness.
+  Quality: strict TypeScript, package-scoped ESLint, no configured formatter, and no unified coverage threshold.
+  Boundaries: shared contracts must address web, desktop, VS Code, hosted mobile, and Capacitor mobile intentionally.
+  Ownership: shared UI in ui, server/CLI in web, privileged native behavior in electron, and shell-only behavior in mobile.
+  Constraints: load matching skills/docs, keep changes minimal, add no dependencies implicitly, and validate the owning runtime.
+
+testing:
+  detected_at: 2026-08-15
+  strict_tdd: true
+  strict_tdd_source: runner-fallback
+  default_test_command: bun run test
+  runner_dispatch:
+    command: node scripts/run-isolated-tests.mjs
+    behavior: TypeScript and bun:test files use Bun; JavaScript node:test files use Node; every file runs in a separate process.
+  packages:
+    scripts:
+      language: JavaScript and MJS repository tooling
+      test: node scripts/run-isolated-tests.mjs scripts
+      type_check: null
+      lint: null
+    ui:
+      language: TypeScript and TSX with a small legacy JavaScript test subset
+      test: bun run --cwd packages/ui test
+      runner: isolated Bun test
+      type_check: bun run --cwd packages/ui type-check
+      lint: bun run --cwd packages/ui lint
+    web:
+      language: TypeScript and TSX client; ESM JavaScript server and CLI; declaration files for the published server API
+      test: bun run --cwd packages/web test
+      runner: Vitest 4 with a bun:test compatibility alias
+      type_check: bun run --cwd packages/web type-check
+      lint: bun run --cwd packages/web lint
+    electron:
+      language: ESM JavaScript and MJS/CJS tooling
+      test: bun run --cwd packages/electron test
+      runner: isolated Bun test and Node test
+      focused_tests:
+        - bun run --cwd packages/electron test:architecture
+        - bun run --cwd packages/electron test:updater
+      type_check: bun run --cwd packages/electron type-check
+      lint: bun run --cwd packages/electron lint
+    vscode:
+      language: TypeScript extension and TSX webview with JavaScript compatibility tests
+      test: bun run --cwd packages/vscode test
+      runner: isolated Bun test and Node test imports executed through Bun for TypeScript
+      type_check: bun run --cwd packages/vscode type-check
+      lint: bun run --cwd packages/vscode lint
+    mobile:
+      language: TypeScript Capacitor configuration, MJS tooling, and native iOS/Android projects
+      test: null
+      runner: null
+      type_check: bun run --cwd packages/mobile type-check
+      lint: bun run --cwd packages/mobile lint
+    docs:
+      language: MDX content outside the Bun workspace
+      test: bun run docs:validate
+      runner: custom documentation validator
+      type_check: null
+      lint: null
+  layers:
+    unit:
+      available: true
+      tools: [bun:test, node:test, vitest]
+    integration:
+      available: true
+      tools: [supertest, runtime and route fixtures]
+    e2e:
+      available: false
+      tools: []
+      note: Electron and mobile provide focused native build, smoke, and updater-fixture checks, not a general E2E harness.
+  coverage:
+    available: true
+    focused_command: bun test --coverage <test-path>
+    workspace_command: null
+    threshold: null
+    note: Bun coverage is installed and available; the root isolated dispatcher and Vitest package have no wired aggregate coverage command or threshold.
+  quality:
+    linter:
+      available: true
+      command: bun run lint
+    type_checker:
+      available: true
+      command: bun run type-check
+    formatter:
+      available: false
+      command: null
+
+rules:
+  proposal:
+    - Keep intent, scope, non-goals, rollback, affected runtimes, and package ownership explicit.
+    - Preserve interactive execution, both persistence backends, auto-chain delivery, and the 800-line review budget.
+  specs:
+    - Use RFC 2119 keywords and Given/When/Then scenarios.
+    - Define intentional behavior for every applicable runtime when shared contracts change.
+  design:
+    - Respect package ownership and keep privileged/native enforcement at the owning runtime boundary.
+    - Document authority, partial failure, rollback, cleanup, stale-data behavior, and cross-workspace consumers when applicable.
+  tasks:
+    - Group work into reviewable units and forecast against the 800 authored changed-line budget.
+    - Automatically split oversized work into chained PR slices with tests and rollback per slice.
+  apply:
+    guidelines:
+      - Load every matching project skill and nearest owning documentation before editing.
+      - Use focused package tests during RED-GREEN-REFACTOR and finish with the validation required by the affected boundary.
+      - Run bun run dead-code for source file or export/import shape changes and inspect its non-blocking report.
+    tdd: true
+    test_command: bun run test
+  verify:
+    test_command: bun run test
+    build_command: bun run type-check && bun run lint
+    coverage_command: null
+    coverage_threshold: 0
+    guidelines:
+      - Report exactly what ran and what platform/runtime behavior remains unvalidated.
+  archive:
+    - Warn before merging destructive deltas and preserve archived change artifacts as an immutable audit trail.
