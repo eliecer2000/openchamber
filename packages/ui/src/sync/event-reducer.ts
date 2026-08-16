@@ -190,12 +190,28 @@ export type CodexProjectionChange =
   | { kind: "session.status"; status: "starting" | "running" | "waiting_approval" | "interrupting" | "idle" | "failed" }
   | { kind: "session.diff"; diff: FileDiff[] }
   | { kind: "approval.pending"; approval: PermissionRequest }
+  | { kind: "approval.resolved"; requestId: string }
+  | { kind: "turn.changed"; turn: { id: string } | null }
 
 export type CodexProjectionEvent = {
   engine: "codex"
   sessionID: string
   revision: number
   changes: readonly CodexProjectionChange[]
+}
+
+export type CodexProjectionSnapshot = {
+  engine: "codex"
+  sessionID: string
+  revision: number
+  messages: Message[]
+  parts: Part[]
+  status: "starting" | "running" | "waiting_approval" | "interrupting" | "idle" | "failed"
+  pendingApprovals: PermissionRequest[]
+  diff: FileDiff[]
+  activeTurn: { id: string } | null
+  failure: Record<string, unknown> | null
+  recovery: Record<string, unknown>
 }
 
 function hasMessage(draft: State, sessionID: string | undefined, messageID: string): boolean {
@@ -343,18 +359,77 @@ export function applyCodexProjectionEvents(
       }
       continue
     }
-    const permissions = draft.permission[event.sessionID] ?? []
-    const index = permissions.findIndex((permission) => permission.id === change.approval.id)
-    if (index < 0 || !areJsonEquivalent(permissions[index], change.approval)) {
-      const next = [...permissions]
-      if (index < 0) next.push(change.approval)
-      else next[index] = change.approval
-      draft.permission[event.sessionID] = next
-      changed = true
+    if (change.kind === "approval.pending") {
+      const permissions = draft.permission[event.sessionID] ?? []
+      const index = permissions.findIndex((permission) => permission.id === change.approval.id)
+      if (index < 0 || !areJsonEquivalent(permissions[index], change.approval)) {
+        const next = [...permissions]
+        if (index < 0) next.push(change.approval)
+        else next[index] = change.approval
+        draft.permission[event.sessionID] = next
+        changed = true
+      }
+      continue
+    }
+    if (change.kind === "approval.resolved") {
+      const permissions = draft.permission[event.sessionID] ?? []
+      const next = permissions.filter((permission) => permission.id !== change.requestId)
+      if (next.length !== permissions.length) {
+        draft.permission[event.sessionID] = next
+        changed = true
+      }
     }
     }
   }
   return { changed, revisions }
+}
+
+export function applyCodexProjectionSnapshot(draft: State, snapshot: CodexProjectionSnapshot): boolean {
+  const sessionID = snapshot.sessionID
+  const previousMessages = draft.message[sessionID] ?? []
+  let changed = false
+  if (!areJsonEquivalent(previousMessages, snapshot.messages)) {
+    draft.message[sessionID] = snapshot.messages
+    changed = true
+  }
+
+  const nextParts = new Map<string, Part[]>()
+  for (const part of snapshot.parts) {
+    const bucket = nextParts.get(part.messageID)
+    if (bucket) bucket.push(part)
+    else nextParts.set(part.messageID, [part])
+  }
+  const affectedMessageIDs = new Set(previousMessages.map((message) => message.id))
+  for (const message of snapshot.messages) affectedMessageIDs.add(message.id)
+  for (const messageID of affectedMessageIDs) {
+    const next = nextParts.get(messageID) ?? []
+    const previous = draft.part[messageID]
+    if (next.length === 0) {
+      if (previous !== undefined) {
+        delete draft.part[messageID]
+        changed = true
+      }
+    } else if (!areJsonEquivalent(previous, next)) {
+      draft.part[messageID] = next
+      changed = true
+    }
+  }
+
+  const status = ["starting", "running", "waiting_approval", "interrupting"].includes(snapshot.status)
+    ? { type: "busy" } as const : { type: "idle" } as const
+  if (!areSessionStatusesEqual(draft.session_status[sessionID], status)) {
+    draft.session_status[sessionID] = status
+    changed = true
+  }
+  if (!areJsonEquivalent(draft.session_diff[sessionID], snapshot.diff)) {
+    draft.session_diff[sessionID] = snapshot.diff
+    changed = true
+  }
+  if (!areJsonEquivalent(draft.permission[sessionID], snapshot.pendingApprovals)) {
+    draft.permission[sessionID] = snapshot.pendingApprovals
+    changed = true
+  }
+  return changed
 }
 
 export function applyCodexProjectionEvent(

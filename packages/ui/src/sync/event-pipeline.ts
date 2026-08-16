@@ -21,6 +21,7 @@ import { openRuntimeWebSocket } from "@/lib/relay/runtime-socket"
 import { syncDebug } from "./debug"
 import { countSyncPerformance } from "./performance-diagnostics"
 import type { CodexProjectionChange, CodexProjectionEvent } from "./event-reducer"
+import { getImperativeSessionMessageLoader } from "./session-message-loader"
 
 const FLUSH_FRAME_MS = 33
 const BACKPRESSURE_FLUSH_FRAME_MS = 200
@@ -70,7 +71,37 @@ const parseCodexChange = (value: unknown): CodexProjectionChange | null => {
   if (value.kind === "approval.pending") {
     return isRecord(value.approval) && typeof value.approval.id === "string" ? value as CodexProjectionChange : null
   }
+  if (value.kind === "approval.resolved") {
+    return typeof value.requestId === "string" ? value as CodexProjectionChange : null
+  }
+  if (value.kind === "turn.changed") {
+    return value.turn === null || (isRecord(value.turn) && typeof value.turn.id === "string")
+      ? value as CodexProjectionChange : null
+  }
   return null
+}
+
+function parseCodexProjectionEvent(value: unknown): CodexProjectionEvent | null {
+  if (!isRecord(value) || value.engine !== "codex" || typeof value.sessionID !== "string"
+    || !Number.isSafeInteger(value.revision) || Number(value.revision) <= 0 || !Array.isArray(value.changes)
+    || value.changes.length === 0) return null
+  const changes = value.changes.map(parseCodexChange)
+  if (changes.some((change) => change === null)) return null
+  if (changes.some((change) => {
+    if (!change) return true
+    if (change.kind === "message.upsert" || change.kind === "message.error") {
+      return change.message.sessionID !== value.sessionID
+    }
+    if (change.kind === "part.upsert") return change.part.sessionID !== value.sessionID
+    if (change.kind === "approval.pending") return change.approval.sessionID !== value.sessionID
+    return false
+  })) return null
+  return {
+    engine: "codex",
+    sessionID: value.sessionID,
+    revision: Number(value.revision),
+    changes: changes as CodexProjectionChange[],
+  }
 }
 
 export function orderCodexProjectionEvents(
@@ -129,6 +160,11 @@ export type EventPipelineInput = {
   heartbeatTimeoutMs?: number
   reconnectDelayMs?: number
   wsReadyTimeoutMs?: number
+  codexReconciler?: {
+    accept: (directory: string, event: CodexProjectionEvent) => void
+    reject: (directory: string, sessionID?: string, revision?: number) => void
+    reconnect: () => void
+  }
 } & EventPipelineDelivery
 
 export type EventPipeline = {
@@ -328,6 +364,7 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
     heartbeatTimeoutMs = DEFAULT_HEARTBEAT_TIMEOUT_MS,
     reconnectDelayMs = DEFAULT_RECONNECT_DELAY_MS,
     wsReadyTimeoutMs = DEFAULT_WS_READY_TIMEOUT_MS,
+    codexReconciler,
   } = input
   const abort = new AbortController()
   let disconnected = false
@@ -335,6 +372,30 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
   let wsFallbackUntil = 0
 
   const directories = new Map<string, DirectoryQueue>()
+
+  const getCodexReconciler = () => codexReconciler ?? {
+    accept: (directory: string, event: CodexProjectionEvent) => {
+      getImperativeSessionMessageLoader()?.acceptCodexProjection(directory, event)
+    },
+    reject: (directory: string, sessionID?: string, revision?: number) => {
+      getImperativeSessionMessageLoader()?.rejectCodexProjection(directory, sessionID, revision)
+    },
+    reconnect: () => {
+      getImperativeSessionMessageLoader()?.reconcileCodexSessions()
+    },
+  }
+
+  const routeCodexProjection = (directory: string, value: unknown): boolean => {
+    if (!isRecord(value) || value.engine !== "codex") return false
+    const event = parseCodexProjectionEvent(value)
+    if (event) getCodexReconciler().accept(directory, event)
+    else getCodexReconciler().reject(
+      directory,
+      typeof value.sessionID === "string" ? value.sessionID : undefined,
+      Number.isSafeInteger(value.revision) ? Number(value.revision) : undefined,
+    )
+    return true
+  }
 
   const getOrCreateDir = (directory: string): DirectoryQueue => {
     let d = directories.get(directory)
@@ -529,6 +590,7 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
     // to be flipped positively; without this the send button throws
     // "Connection lost" until something else (HTTP health check) happens
     // to race a setState({isConnected: true}) through.
+    getCodexReconciler().reconnect()
     onReconnect?.()
   }
 
@@ -650,7 +712,11 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
       resetHeartbeat()
       streamErrorLogged = false
 
-      const payload = resolveEventPayload((event as { payload?: Event }).payload ?? event)
+      const rawPayload = (event as { payload?: unknown }).payload ?? event
+      const rawDirectory = typeof (event as { directory?: unknown }).directory === "string"
+        ? (event as { directory: string }).directory : "global"
+      if (routeCodexProjection(rawDirectory, rawPayload)) continue
+      const payload = resolveEventPayload(rawPayload)
       if (!payload) {
         continue
       }
@@ -796,6 +862,7 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
 
         if (frame.type === "backpressure") {
           backpressureUntil = Date.now() + BACKPRESSURE_MODE_MS
+          getCodexReconciler().reject(frame.directory ?? "global")
           return
         }
 
@@ -803,6 +870,7 @@ export function createEventPipeline(input: EventPipelineInput): EventPipeline {
           return
         }
 
+        if (routeCodexProjection(frame.directory ?? "global", frame.payload)) return
         const payload = resolveEventPayload(frame.payload)
         if (!payload) {
           return

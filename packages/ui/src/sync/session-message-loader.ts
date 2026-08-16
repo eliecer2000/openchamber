@@ -16,6 +16,13 @@ import { isVSCodeRuntime } from "@/lib/desktop"
 import { isMobileSurfaceRuntime } from "@/lib/runtimeSurface"
 import { normalizePath } from "@/lib/pathNormalization"
 import { startSessionLoadPerformanceEvent } from "./session-load-performance"
+import { fetchCodexProjectionSnapshot } from "./bootstrap"
+import {
+  applyCodexProjectionEvents,
+  applyCodexProjectionSnapshot,
+  type CodexProjectionEvent,
+  type CodexProjectionSnapshot,
+} from "./event-reducer"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const INITIAL_MESSAGE_PAGE_SIZE = 50
@@ -23,6 +30,8 @@ const CONSTRAINED_INITIAL_MESSAGE_PAGE_SIZE = 30
 const HISTORY_MESSAGE_PAGE_SIZE = 100
 const INITIAL_PAGE_EXPANSION_LIMITS = [100, 150] as const
 const CONSTRAINED_INITIAL_PAGE_EXPANSION_LIMITS = [50, 80, 120] as const
+const CODEX_EVENT_BUFFER_LIMIT = 256
+const CODEX_REPAIR_ATTEMPT_LIMIT = 2
 
 export type SessionMessageTarget = {
   directory: string
@@ -45,12 +54,18 @@ export type SessionMessageLoadState = {
 }
 
 type LoaderEntry = {
+  target: SessionMessageTarget
   snapshot: SessionMessageLoadState
   listeners: Set<() => void>
   inflight: Promise<void> | null
   queuedRefresh: Promise<void> | null
   queuedRefreshLimit: number
   optimistic: Map<string, OptimisticItem>
+  codexRevision: number
+  codexBuffer: CodexProjectionEvent[]
+  codexNeedsResync: boolean
+  codexRequiredRevision: number
+  codexRepairAttempts: number
 }
 
 type FetchedPage = {
@@ -68,6 +83,7 @@ type LoadPerformanceDetails = {
 type LoaderConfiguration = {
   sdk: OpencodeClient
   runtimeKey: string
+  fetchCodexSnapshot?: (target: SessionMessageTarget) => Promise<CodexProjectionSnapshot>
 }
 
 const isConstrainedRuntime = () => isVSCodeRuntime() || isMobileSurfaceRuntime()
@@ -129,6 +145,7 @@ export class SessionMessageLoader {
   private sdk: OpencodeClient
   private runtimeKey: string
   private sdkEpoch = 0
+  private fetchCodexSnapshot: (target: SessionMessageTarget) => Promise<CodexProjectionSnapshot>
   private disposed = false
   private readonly entries = new Map<string, LoaderEntry>()
 
@@ -138,14 +155,17 @@ export class SessionMessageLoader {
   ) {
     this.sdk = configuration.sdk
     this.runtimeKey = configuration.runtimeKey
+    this.fetchCodexSnapshot = configuration.fetchCodexSnapshot ?? fetchCodexProjectionSnapshot
   }
 
   configure(configuration: LoaderConfiguration): void {
-    if (this.sdk === configuration.sdk && this.runtimeKey === configuration.runtimeKey) return
+    const nextFetcher = configuration.fetchCodexSnapshot ?? this.fetchCodexSnapshot
+    if (this.sdk === configuration.sdk && this.runtimeKey === configuration.runtimeKey && this.fetchCodexSnapshot === nextFetcher) return
     const runtimeChanged = this.runtimeKey !== configuration.runtimeKey
     const previousRuntimeKey = this.runtimeKey
     this.sdk = configuration.sdk
     this.runtimeKey = configuration.runtimeKey
+    this.fetchCodexSnapshot = nextFetcher
     this.sdkEpoch += 1
     for (const entry of this.entries.values()) {
       entry.snapshot = {
@@ -182,6 +202,7 @@ export class SessionMessageLoader {
   ): Promise<void> {
     const normalized = this.normalizeTarget(target)
     if (!normalized || this.disposed) return Promise.resolve()
+    if (this.isCodexTarget(normalized)) return this.ensureCodex(normalized, options?.force === true)
     const entry = this.getEntry(normalized)
     const store = this.childStores.ensureChild(normalized.directory, { bootstrap: false })
     const materialization = getSessionMaterializationStatus(store.getState(), normalized.sessionID)
@@ -216,6 +237,7 @@ export class SessionMessageLoader {
   loadOlder(target: SessionMessageTarget): Promise<void> {
     const normalized = this.normalizeTarget(target)
     if (!normalized || this.disposed) return Promise.resolve()
+    if (this.isCodexTarget(normalized)) return this.ensureCodex(normalized, false)
     const entry = this.getEntry(normalized)
     if (entry.inflight) return entry.inflight.then(() => this.loadOlder(normalized))
     if (entry.snapshot.complete || !entry.snapshot.cursor) return Promise.resolve()
@@ -243,6 +265,12 @@ export class SessionMessageLoader {
   async loadComplete(target: SessionMessageTarget): Promise<void> {
     const normalized = this.normalizeTarget(target)
     if (!normalized || this.disposed) throw new Error("Session message loader is unavailable")
+    if (this.isCodexTarget(normalized)) {
+      await this.ensureCodex(normalized, false)
+      const snapshot = this.getSnapshot(normalized)
+      if (snapshot.status === "error") throw snapshot.error ?? new Error("Codex projection could not be loaded")
+      return
+    }
     const initial = this.getSnapshot(normalized)
     await this.ensure(normalized, { force: !initial.resolved })
 
@@ -264,6 +292,7 @@ export class SessionMessageLoader {
   refreshTail(target: SessionMessageTarget, limit: number): Promise<void> {
     const normalized = this.normalizeTarget(target)
     if (!normalized || this.disposed) return Promise.resolve()
+    if (this.isCodexTarget(normalized)) return this.ensureCodex(normalized, true)
     const entry = this.getEntry(normalized)
     if (entry.inflight) {
       entry.queuedRefreshLimit = Math.max(entry.queuedRefreshLimit, limit)
@@ -333,6 +362,68 @@ export class SessionMessageLoader {
     const entry = this.getEntry(normalized)
     entry.listeners.add(listener)
     return () => entry.listeners.delete(listener)
+  }
+
+  acceptCodexProjection(directory: string, event: CodexProjectionEvent): void {
+    const target = this.resolveCodexTarget(directory, event.sessionID)
+    if (!target || this.disposed) return
+    const entry = this.getEntry(target)
+    if (event.revision <= entry.codexRevision) return
+    if (entry.inflight || !entry.snapshot.resolved) {
+      this.bufferCodexEvent(entry, event)
+      return
+    }
+    if (event.revision !== entry.codexRevision + 1) {
+      entry.codexRequiredRevision = Math.max(entry.codexRequiredRevision, event.revision)
+      this.requestCodexResync(entry)
+      return
+    }
+    this.commitCodexState(entry, null, [event])
+    entry.codexRevision = event.revision
+  }
+
+  rejectCodexProjection(directory: string, sessionID?: string, revision?: number): void {
+    const target = sessionID ? this.resolveCodexTarget(directory, sessionID) : null
+    const entries = target ? [this.getEntry(target)] : [...this.entries.values()].filter((entry) =>
+      this.isCodexTarget(entry.target) && (directory === "global" || entry.target.directory === normalizePath(directory)))
+    for (const entry of entries) {
+      if (revision !== undefined) entry.codexRequiredRevision = Math.max(entry.codexRequiredRevision, revision)
+      this.requestCodexResync(entry)
+    }
+  }
+
+  reconcileCodexSessions(): void {
+    for (const entry of this.entries.values()) {
+      if (!this.isCodexTarget(entry.target)) continue
+      if (!entry.snapshot.resolved && !this.childStores.getChild(entry.target.directory)) continue
+      this.requestCodexResync(entry)
+    }
+  }
+
+  getCodexRevision(target: SessionMessageTarget): number {
+    const normalized = this.normalizeTarget(target)
+    return normalized ? this.getEntry(normalized).codexRevision : 0
+  }
+
+  getCodexBufferedEventCount(target: SessionMessageTarget): number {
+    const normalized = this.normalizeTarget(target)
+    return normalized ? this.getEntry(normalized).codexBuffer.length : 0
+  }
+
+  setCodexSnapshotFetcher(fetcher: (target: SessionMessageTarget) => Promise<CodexProjectionSnapshot>): void {
+    this.fetchCodexSnapshot = fetcher
+  }
+
+  async waitForCodexReconciliation(target: SessionMessageTarget): Promise<void> {
+    const normalized = this.normalizeTarget(target)
+    if (!normalized) return
+    const entry = this.getEntry(normalized)
+    for (let count = 0; count < 10; count += 1) {
+      if (entry.inflight) await entry.inflight
+      if (!entry.codexNeedsResync && !entry.inflight) return
+      await Promise.resolve()
+    }
+    throw new Error("Codex reconciliation did not settle")
   }
 
   optimisticAdd(input: SessionMessageTarget & { message: Message; parts: Part[] }): void {
@@ -432,6 +523,7 @@ export class SessionMessageLoader {
     if (existing) return existing
     const prefetched = getSessionPrefetch(target.directory, target.sessionID, this.runtimeKey)
     const entry: LoaderEntry = {
+      target,
       snapshot: prefetched
         ? {
             ...createDefaultState(),
@@ -448,6 +540,11 @@ export class SessionMessageLoader {
       queuedRefresh: null,
       queuedRefreshLimit: 0,
       optimistic: new Map(),
+      codexRevision: 0,
+      codexBuffer: [],
+      codexNeedsResync: false,
+      codexRequiredRevision: 0,
+      codexRepairAttempts: 0,
     }
     this.entries.set(key, entry)
     return entry
@@ -466,6 +563,123 @@ export class SessionMessageLoader {
 
   private notify(entry: LoaderEntry): void {
     for (const listener of entry.listeners) listener()
+  }
+
+  private isCodexTarget(target: SessionMessageTarget): boolean {
+    return target.sessionID.startsWith("ses_codex_")
+  }
+
+  private resolveCodexTarget(directory: string, sessionID: string): SessionMessageTarget | null {
+    const normalizedDirectory = directory === "global" ? null : normalizePath(directory)
+    if (normalizedDirectory) return { directory: normalizedDirectory, sessionID }
+    const matches = [...this.entries.values()].filter((entry) => entry.target.sessionID === sessionID)
+    return matches.length === 1 ? matches[0].target : null
+  }
+
+  private bufferCodexEvent(entry: LoaderEntry, event: CodexProjectionEvent): void {
+    if (entry.codexBuffer.length >= CODEX_EVENT_BUFFER_LIMIT) {
+      entry.codexBuffer.length = 0
+      entry.codexRequiredRevision = Math.max(entry.codexRequiredRevision, event.revision)
+      this.requestCodexResync(entry)
+      return
+    }
+    entry.codexBuffer.push(event)
+  }
+
+  private requestCodexResync(entry: LoaderEntry): void {
+    if (!entry.codexNeedsResync) entry.codexRepairAttempts = 0
+    entry.codexNeedsResync = true
+    if (entry.inflight || this.disposed) return
+    void this.ensureCodex(entry.target, true)
+  }
+
+  private ensureCodex(target: SessionMessageTarget, force: boolean): Promise<void> {
+    const entry = this.getEntry(target)
+    if (entry.inflight) return entry.inflight
+    if (!force && entry.snapshot.resolved && !entry.codexNeedsResync) return Promise.resolve()
+    entry.codexNeedsResync = false
+    if (force) entry.codexRepairAttempts += 1
+    const store = this.childStores.ensureChild(target.directory, { bootstrap: false })
+    if (force) this.bumpGeneration(entry)
+    const load = this.startLoad(target, entry, store, force ? "refresh" : "initial", async (isCurrent) => {
+      const snapshot = await this.fetchCodexSnapshot(target)
+      if (!isCurrent()) return
+      if (snapshot.sessionID !== target.sessionID || snapshot.revision < entry.codexRevision) {
+        entry.codexRequiredRevision = Math.max(entry.codexRequiredRevision, entry.codexRevision)
+        throw new Error("Codex projection snapshot revision is stale")
+      }
+
+      const ordered = [...entry.codexBuffer].sort((left, right) => left.revision - right.revision)
+      const contiguous: CodexProjectionEvent[] = []
+      let revision = snapshot.revision
+      let gapRevision = 0
+      for (const event of ordered) {
+        if (event.revision <= revision) continue
+        if (event.revision !== revision + 1) {
+          gapRevision = event.revision
+          break
+        }
+        contiguous.push(event)
+        revision = event.revision
+      }
+      entry.codexBuffer.length = 0
+      if (gapRevision > 0) entry.codexRequiredRevision = Math.max(entry.codexRequiredRevision, gapRevision)
+      this.commitCodexState(entry, snapshot, contiguous)
+      entry.codexRevision = revision
+      if (entry.codexRevision >= entry.codexRequiredRevision) entry.codexRequiredRevision = 0
+      entry.codexNeedsResync = entry.codexRequiredRevision > entry.codexRevision
+      if (!entry.codexNeedsResync) entry.codexRepairAttempts = 0
+      this.patchEntry(entry, {
+        status: "ready",
+        loadingKind: null,
+        error: null,
+        resolved: true,
+        limit: snapshot.messages.length,
+        cursor: undefined,
+        complete: true,
+        updatedAt: Date.now(),
+      })
+    })
+    return load.finally(() => {
+      if (entry.codexNeedsResync && entry.codexRepairAttempts >= CODEX_REPAIR_ATTEMPT_LIMIT) {
+        entry.codexNeedsResync = false
+        this.patchEntry(entry, {
+          status: "error",
+          loadingKind: null,
+          error: new Error("Codex projection reconciliation did not converge"),
+        })
+        return
+      }
+      if (entry.codexNeedsResync && !this.disposed) queueMicrotask(() => {
+        if (entry.codexNeedsResync && !entry.inflight) void this.ensureCodex(entry.target, true)
+      })
+    })
+  }
+
+  private commitCodexState(
+    entry: LoaderEntry,
+    snapshot: CodexProjectionSnapshot | null,
+    events: readonly CodexProjectionEvent[],
+  ): void {
+    const store = this.childStores.getChild(entry.target.directory)
+    if (!store) return
+    store.setState((current) => {
+      const draft: DirectoryStore = {
+        ...current,
+        message: { ...current.message },
+        part: { ...current.part },
+        session_status: { ...current.session_status },
+        session_diff: { ...current.session_diff },
+        permission: { ...current.permission },
+      }
+      const snapshotChanged = snapshot ? applyCodexProjectionSnapshot(draft, snapshot) : false
+      const eventResult = applyCodexProjectionEvents(
+        draft,
+        events,
+        { [entry.target.sessionID]: snapshot?.revision ?? entry.codexRevision },
+      )
+      return snapshotChanged || eventResult.changed ? draft : current
+    })
   }
 
   private startLoad(

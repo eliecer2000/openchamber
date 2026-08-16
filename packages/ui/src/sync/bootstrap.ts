@@ -3,8 +3,57 @@ import { retry } from "./retry"
 import type { GlobalState, State } from "./types"
 import { runtimeFetch } from "../lib/runtime-fetch"
 import { emitSyncConfigChanged } from "./sync-refs"
+import type { CodexProjectionSnapshot } from "./event-reducer"
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+
+const CODEX_STATUSES = new Set(["starting", "running", "waiting_approval", "interrupting", "idle", "failed"])
+
+export function parseCodexProjectionSnapshot(value: unknown): CodexProjectionSnapshot {
+  if (!isRecord(value) || value.engine !== "codex" || typeof value.sessionID !== "string"
+    || !Number.isSafeInteger(value.revision) || Number(value.revision) < 0
+    || !Array.isArray(value.messages) || !Array.isArray(value.parts)
+    || !CODEX_STATUSES.has(String(value.status)) || !Array.isArray(value.pendingApprovals)
+    || !Array.isArray(value.diff) || !(value.activeTurn === null || isRecord(value.activeTurn))
+    || !(value.failure === null || isRecord(value.failure)) || !isRecord(value.recovery)) {
+    throw new Error("Codex server returned a malformed projection snapshot")
+  }
+  const sessionID = value.sessionID
+  const validMessages = value.messages.every((message) => isRecord(message)
+    && typeof message.id === "string" && message.sessionID === sessionID)
+  const messageIDs = new Set(value.messages.map((message) => (message as Record<string, unknown>).id))
+  const validParts = value.parts.every((part) => isRecord(part) && typeof part.id === "string"
+    && typeof part.messageID === "string" && messageIDs.has(part.messageID))
+  const validApprovals = value.pendingApprovals.every((approval) => isRecord(approval)
+    && typeof approval.id === "string" && approval.sessionID === sessionID)
+  const validDiff = value.diff.every((diff) => isRecord(diff) && typeof diff.file === "string")
+  if (!validMessages || !validParts || !validApprovals || !validDiff) {
+    throw new Error("Codex server returned a malformed projection snapshot")
+  }
+  return value as unknown as CodexProjectionSnapshot
+}
+
+export async function fetchCodexProjectionSnapshot(input: {
+  sessionID: string
+  directory: string
+}): Promise<CodexProjectionSnapshot> {
+  const response = await runtimeFetch(`/api/codex/sessions/${encodeURIComponent(input.sessionID)}/messages`, {
+    query: { directory: input.directory },
+  })
+  const payload: unknown = await response.json().catch(() => null)
+  if (!response.ok) {
+    const message = isRecord(payload) && typeof payload.error === "string"
+      ? payload.error
+      : "Failed to read Codex projection snapshot"
+    const error = new Error(message) as Error & { status?: number }
+    error.status = response.status
+    throw error
+  }
+  return parseCodexProjectionSnapshot(payload)
+}
 
 /**
  * SDK returns `{ data, error, response }` without throwing on non-2xx.

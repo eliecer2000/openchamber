@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { Message, OpencodeClient, Part } from "@opencode-ai/sdk/v2/client"
 import { ChildStoreManager } from "./child-store"
 import { SessionMessageLoader } from "./session-message-loader"
+import type { CodexProjectionEvent, CodexProjectionSnapshot } from "./event-reducer"
 import {
   createFirstVisibleSessionPerformanceTracker,
   startSessionLoadPerformanceEvent,
@@ -35,6 +36,34 @@ const createLoader = (messages: (input: {
   const sdk = { session: { messages } } as unknown as OpencodeClient
   const loader = new SessionMessageLoader(childStores, { sdk, runtimeKey: "runtime-a" })
   return { childStores, loader }
+}
+
+const codexSnapshot = (revision: number, text: string, approvalId = "approval-current"): CodexProjectionSnapshot => ({
+  engine: "codex",
+  sessionID: "ses_codex_1",
+  revision,
+  messages: [{ id: "msg_codex_1", sessionID: "ses_codex_1", role: "assistant", time: { created: 1 } } as Message],
+  parts: [{ id: "prt_codex_1", messageID: "msg_codex_1", sessionID: "ses_codex_1", type: "text", text } as Part],
+  status: "running",
+  pendingApprovals: [{ id: approvalId, sessionID: "ses_codex_1" } as never],
+  diff: [],
+  activeTurn: { id: "turn-1" },
+  failure: null,
+  recovery: { kind: "memory" },
+})
+
+const codexStatusEvent = (revision: number, status: "running" | "idle" = "idle"): CodexProjectionEvent => ({
+  engine: "codex",
+  sessionID: "ses_codex_1",
+  revision,
+  changes: [{ kind: "session.status", status }],
+})
+
+const createCodexLoader = (fetchSnapshot: () => Promise<CodexProjectionSnapshot>) => {
+  const childStores = new ChildStoreManager()
+  const sdk = { session: { messages: async () => response([]) } } as unknown as OpencodeClient
+  const loader = new SessionMessageLoader(childStores, { sdk, runtimeKey: "runtime-a", fetchCodexSnapshot: fetchSnapshot })
+  return { childStores, loader, sdk }
 }
 
 describe("SessionMessageLoader", () => {
@@ -424,6 +453,146 @@ describe("SessionMessageLoader", () => {
       if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow)
       else Reflect.deleteProperty(globalThis, "window")
     }
+  })
+
+  test("buffers live Codex events before the snapshot and commits snapshot plus contiguous events atomically", async () => {
+    const pending = deferred<CodexProjectionSnapshot>()
+    const { childStores, loader } = createCodexLoader(() => pending.promise)
+    const target = { directory: "/repo", sessionID: "ses_codex_1" }
+    const store = childStores.ensureChild(target.directory, { bootstrap: false })
+    let publications = 0
+    const unsubscribe = store.subscribe(() => { publications += 1 })
+
+    const loading = loader.ensure(target)
+    loader.acceptCodexProjection(target.directory, codexStatusEvent(6, "idle"))
+    loader.acceptCodexProjection(target.directory, codexStatusEvent(5, "running"))
+    pending.resolve(codexSnapshot(4, "authoritative", "approval-new"))
+    await loading
+
+    expect(loader.getCodexRevision(target)).toBe(6)
+    expect((store.getState().part.msg_codex_1?.[0] as { text?: string })?.text).toBe("authoritative")
+    expect(store.getState().session_status.ses_codex_1).toEqual({ type: "idle" })
+    expect(store.getState().permission.ses_codex_1.map((item) => item.id)).toEqual(["approval-new"])
+    expect(publications).toBe(1)
+    unsubscribe()
+    loader.dispose()
+    childStores.disposeAll()
+  })
+
+  test("replaces a stale cached Codex snapshot and preserves unrelated session references", async () => {
+    const { childStores, loader } = createCodexLoader(async () => codexSnapshot(9, "fresh"))
+    const target = { directory: "/repo", sessionID: "ses_codex_1" }
+    const store = childStores.ensureChild(target.directory, { bootstrap: false })
+    const other = [createRecord("ses_other", "msg_other").info]
+    store.setState({
+      message: {
+        [target.sessionID]: [createRecord(target.sessionID, "msg_stale").info],
+        ses_other: other,
+      },
+      permission: { [target.sessionID]: [{ id: "approval-stale", sessionID: target.sessionID } as never] },
+    })
+
+    await loader.ensure(target)
+
+    expect(store.getState().message[target.sessionID].map((item) => item.id)).toEqual(["msg_codex_1"])
+    expect(store.getState().message.ses_other).toBe(other)
+    expect(store.getState().permission[target.sessionID].map((item) => item.id)).toEqual(["approval-current"])
+    loader.dispose()
+    childStores.disposeAll()
+  })
+
+  test("fails closed on a gap or overflow and refetches instead of inventing convergence", async () => {
+    const snapshots = [codexSnapshot(3, "first"), codexSnapshot(300, "repaired")]
+    let calls = 0
+    const { childStores, loader } = createCodexLoader(async () => snapshots[Math.min(calls++, 1)])
+    const target = { directory: "/repo", sessionID: "ses_codex_1" }
+
+    await loader.ensure(target)
+    loader.acceptCodexProjection(target.directory, codexStatusEvent(5))
+    await loader.waitForCodexReconciliation(target)
+    expect(calls).toBe(2)
+    expect(loader.getCodexRevision(target)).toBe(300)
+
+    const pending = deferred<CodexProjectionSnapshot>()
+    loader.setCodexSnapshotFetcher(() => pending.promise)
+    loader.reconcileCodexSessions()
+    for (let revision = 301; revision <= 557; revision += 1) {
+      loader.acceptCodexProjection(target.directory, codexStatusEvent(revision))
+    }
+    expect(loader.getCodexBufferedEventCount(target) <= 256).toBe(true)
+    pending.resolve(codexSnapshot(557, "overflow-repaired"))
+    await loader.waitForCodexReconciliation(target)
+    expect(loader.getCodexRevision(target)).toBe(557)
+    loader.dispose()
+    childStores.disposeAll()
+  })
+
+  test("bounds repeated gap repair when the authoritative server snapshot cannot converge", async () => {
+    let calls = 0
+    const { childStores, loader } = createCodexLoader(async () => {
+      calls += 1
+      return codexSnapshot(3, "still-three")
+    })
+    const target = { directory: "/repo", sessionID: "ses_codex_1" }
+
+    await loader.ensure(target)
+    loader.acceptCodexProjection(target.directory, codexStatusEvent(5))
+    await loader.waitForCodexReconciliation(target)
+
+    expect(calls).toBe(3)
+    expect(loader.getCodexRevision(target)).toBe(3)
+    expect(loader.getSnapshot(target).status).toBe("error")
+    expect(loader.getSnapshot(target).error?.message).toContain("did not converge")
+    loader.dispose()
+    childStores.disposeAll()
+  })
+
+  test("preserves the last valid Codex state on snapshot failure and accepts an explicit retry", async () => {
+    let fail = true
+    const { childStores, loader } = createCodexLoader(async () => {
+      if (fail) throw new Error("snapshot unavailable")
+      return codexSnapshot(7, "recovered")
+    })
+    const target = { directory: "/repo", sessionID: "ses_codex_1" }
+    const store = childStores.ensureChild(target.directory, { bootstrap: false })
+    store.setState({ message: { [target.sessionID]: [createRecord(target.sessionID, "cached").info] } })
+
+    await loader.ensure(target)
+    expect(loader.getSnapshot(target).status).toBe("error")
+    expect(store.getState().message[target.sessionID]?.[0]?.id).toBe("cached")
+
+    fail = false
+    await loader.ensure(target, { force: true })
+    expect(loader.getSnapshot(target).status).toBe("ready")
+    expect((store.getState().part.msg_codex_1?.[0] as { text?: string })?.text).toBe("recovered")
+    loader.dispose()
+    childStores.disposeAll()
+  })
+
+  test("rejects a stale Codex completion after runtime switch and reloads on close/reopen", async () => {
+    const old = deferred<CodexProjectionSnapshot>()
+    const { childStores, loader, sdk } = createCodexLoader(() => old.promise)
+    const target = { directory: "/repo", sessionID: "ses_codex_1" }
+    const loading = loader.ensure(target)
+
+    loader.configure({ sdk, runtimeKey: "runtime-b", fetchCodexSnapshot: async () => codexSnapshot(2, "runtime-b") })
+    old.resolve(codexSnapshot(10, "stale-runtime-a"))
+    await loading
+    expect(childStores.getChild(target.directory)?.getState().part.msg_codex_1).toBe(undefined)
+
+    await loader.ensure(target)
+    expect((childStores.getChild(target.directory)?.getState().part.msg_codex_1?.[0] as { text?: string })?.text).toBe("runtime-b")
+    loader.dispose()
+    const reopened = new SessionMessageLoader(childStores, {
+      sdk,
+      runtimeKey: "runtime-b",
+      fetchCodexSnapshot: async () => codexSnapshot(3, "reopened"),
+    })
+    await reopened.ensure(target)
+    expect(reopened.getCodexRevision(target)).toBe(3)
+    expect((childStores.getChild(target.directory)?.getState().part.msg_codex_1?.[0] as { text?: string })?.text).toBe("reopened")
+    reopened.dispose()
+    childStores.disposeAll()
   })
 })
 

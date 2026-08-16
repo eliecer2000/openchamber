@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import type { Session } from "@opencode-ai/sdk/v2"
 import type { Event, Message, Part, PermissionRequest, QuestionRequest, SessionStatus } from "@opencode-ai/sdk/v2/client"
-import { applyCodexProjectionEvent, applyCodexProjectionEvents, applyDirectoryEvent } from "../event-reducer"
+import {
+  applyCodexProjectionEvent,
+  applyCodexProjectionEvents,
+  applyCodexProjectionSnapshot,
+  applyDirectoryEvent,
+} from "../event-reducer"
 import { INITIAL_STATE, type State } from "../types"
 
 function state(overrides: Partial<State> = {}): State {
@@ -122,6 +127,55 @@ describe("applyDirectoryEvent", () => {
     }, 5)).toEqual({ changed: false, revision: 6 })
     expect(draft.message.ses_codex_1).toBe(messages)
     expect(draft.part[message.id]).toBe(parts)
+  })
+
+  test("authoritatively replaces one Codex session snapshot without touching unrelated buckets", () => {
+    const oldMessage = { id: "msg_old", sessionID: "ses_codex_1", role: "assistant", time: { created: 1 } } as Message
+    const otherMessages = [{ id: "msg_other", sessionID: "ses_other", role: "assistant", time: { created: 1 } } as Message]
+    const otherPermissions = [{ id: "perm_other", sessionID: "ses_other" } as PermissionRequest]
+    const draft = state({
+      message: { ses_codex_1: [oldMessage], ses_other: otherMessages },
+      part: { msg_old: [{ id: "prt_old", messageID: "msg_old", type: "text", text: "stale" } as Part] },
+      permission: {
+        ses_codex_1: [{ id: "approval-old", sessionID: "ses_codex_1" } as PermissionRequest],
+        ses_other: otherPermissions,
+      },
+    })
+
+    expect(applyCodexProjectionSnapshot(draft, {
+      engine: "codex",
+      sessionID: "ses_codex_1",
+      revision: 8,
+      messages: [{ id: "msg_new", sessionID: "ses_codex_1", role: "assistant", time: { created: 2 } } as Message],
+      parts: [{ id: "prt_new", messageID: "msg_new", sessionID: "ses_codex_1", type: "text", text: "current" } as Part],
+      status: "running",
+      pendingApprovals: [{ id: "approval-new", sessionID: "ses_codex_1" } as PermissionRequest],
+      diff: [{ file: "new.ts", patch: "@@" }],
+      activeTurn: { id: "turn-1" },
+      failure: null,
+      recovery: { kind: "memory" },
+    })).toBe(true)
+
+    expect(draft.message.ses_codex_1.map((message) => message.id)).toEqual(["msg_new"])
+    expect(draft.part.msg_old).toBe(undefined)
+    expect(draft.part.msg_new?.[0]?.id).toBe("prt_new")
+    expect(draft.permission.ses_codex_1.map((permission) => permission.id)).toEqual(["approval-new"])
+    expect(draft.session_status.ses_codex_1).toEqual({ type: "busy" })
+    expect(draft.message.ses_other).toBe(otherMessages)
+    expect(draft.permission.ses_other).toBe(otherPermissions)
+  })
+
+  test("removes a resolved Codex approval at the contiguous event revision", () => {
+    const approval = { id: "approval-1", sessionID: "ses_codex_1" } as PermissionRequest
+    const draft = state({ permission: { ses_codex_1: [approval] } })
+
+    expect(applyCodexProjectionEvent(draft, {
+      engine: "codex",
+      sessionID: "ses_codex_1",
+      revision: 2,
+      changes: [{ kind: "approval.resolved", requestId: "approval-1" }],
+    }, 1)).toEqual({ changed: true, revision: 2 })
+    expect(draft.permission.ses_codex_1).toEqual([])
   })
 
   test("inserts post-rollover message events by creation time rather than ID", () => {

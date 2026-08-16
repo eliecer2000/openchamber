@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { OpencodeClient, Project } from "@opencode-ai/sdk/v2/client"
-import { bootstrapDirectory } from "./bootstrap"
+import { bootstrapDirectory, parseCodexProjectionSnapshot } from "./bootstrap"
 import { INITIAL_STATE, type State } from "./types"
 
 const createSdk = (options?: { commandList?: () => Promise<{ data: unknown[] }> }) => ({
@@ -107,5 +107,43 @@ describe("bootstrapDirectory", () => {
 
     expect(result).toBe("stale")
     expect(commits).toBe(0)
+  })
+})
+
+describe("parseCodexProjectionSnapshot", () => {
+  test("accepts the projected WU6R snapshot without granting authority to unknown fields", () => {
+    const snapshot = parseCodexProjectionSnapshot({
+      engine: "codex",
+      sessionID: "ses_codex_1",
+      revision: 4,
+      messages: [{ id: "msg_1", sessionID: "ses_codex_1", role: "assistant", time: { created: 1 } }],
+      parts: [{ id: "prt_1", messageID: "msg_1", sessionID: "ses_codex_1", type: "text", text: "hello" }],
+      status: "waiting_approval",
+      pendingApprovals: [{ id: "approval-1", sessionID: "ses_codex_1" }],
+      diff: [{ file: "a.ts", patch: "@@" }],
+      activeTurn: { id: "turn-1" },
+      failure: null,
+      recovery: { kind: "memory" },
+    })
+
+    expect(snapshot.revision).toBe(4)
+    expect(snapshot.messages[0]?.id).toBe("msg_1")
+    expect(snapshot.pendingApprovals[0]?.id).toBe("approval-1")
+  })
+
+  test("rejects malformed projected snapshots instead of treating them as empty success", () => {
+    expect(() => parseCodexProjectionSnapshot({
+      engine: "codex",
+      sessionID: "ses_codex_1",
+      revision: 4,
+      messages: [],
+      parts: [{ id: "prt_1", messageID: 7 }],
+      status: "idle",
+      pendingApprovals: [],
+      diff: [],
+      activeTurn: null,
+      failure: null,
+      recovery: { kind: "memory" },
+    })).toThrow("malformed")
   })
 })

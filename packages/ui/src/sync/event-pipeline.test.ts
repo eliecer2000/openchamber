@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { Event, OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { createEventPipeline, orderCodexProjectionEvents } from "./event-pipeline"
+import type { CodexProjectionEvent } from "./event-reducer"
 
 const failAfter = (ms: number) => new Promise<never>((_, reject) => {
   setTimeout(() => reject(new Error("Timed out waiting for event pipeline flush")), ms)
@@ -278,6 +279,73 @@ describe("createEventPipeline", () => {
         sessionID: "ses_1",
         status: { type: "idle" },
       })
+    } finally {
+      pipeline.cleanup()
+    }
+  })
+
+  test("routes raw Codex projection envelopes outside OpenCode normalization and fails malformed input closed", async () => {
+    let resolveStreamFinished!: () => void
+    const streamFinished = new Promise<void>((resolve) => { resolveStreamFinished = resolve })
+    const accepted: Array<{ directory: string; event: CodexProjectionEvent }> = []
+    const rejected: Array<{ directory: string; sessionID?: string }> = []
+    const delivered: Event[] = []
+    const valid = { engine: "codex", sessionID: "ses_codex_1", revision: 1, changes: [{ kind: "session.status", status: "running" }] }
+    const malformed = { engine: "codex", sessionID: "ses_codex_1", revision: 2, changes: [{ kind: "unknown" }] }
+    const wrongSession = {
+      engine: "codex",
+      sessionID: "ses_codex_1",
+      revision: 3,
+      changes: [{ kind: "message.upsert", message: { id: "msg_other", sessionID: "ses_codex_other" } }],
+    }
+    const pipeline = createEventPipeline({
+      sdk: createSdk([valid, malformed, wrongSession] as unknown as Event[], resolveStreamFinished),
+      onEvents: (_directory, events) => delivered.push(...events),
+      codexReconciler: {
+        accept: (directory, event) => accepted.push({ directory, event }),
+        reject: (directory, sessionID) => rejected.push({ directory, sessionID }),
+        reconnect: () => undefined,
+      },
+      transport: "sse",
+      heartbeatTimeoutMs: 1_000,
+    })
+
+    try {
+      await streamFinished
+      await Promise.resolve()
+      expect(accepted.map(({ directory, event }) => `${directory}:${event.revision}`)).toEqual(["/repo:1"])
+      expect(rejected).toEqual([
+        { directory: "/repo", sessionID: "ses_codex_1" },
+        { directory: "/repo", sessionID: "ses_codex_1" },
+      ])
+      expect(delivered).toEqual([])
+    } finally {
+      pipeline.cleanup()
+    }
+  })
+
+  test("requests deterministic Codex reconciliation on initial direct/relay subscription and reconnect", async () => {
+    let resolveStreamFinished!: () => void
+    const streamFinished = new Promise<void>((resolve) => { resolveStreamFinished = resolve })
+    let reconnects = 0
+    const pipeline = createEventPipeline({
+      sdk: createSdk([], resolveStreamFinished),
+      onEvents: () => undefined,
+      codexReconciler: {
+        accept: () => undefined,
+        reject: () => undefined,
+        reconnect: () => { reconnects += 1 },
+      },
+      transport: "sse",
+      heartbeatTimeoutMs: 1_000,
+    })
+
+    try {
+      await streamFinished
+      expect(reconnects).toBe(1)
+      pipeline.reconnect("relay-reconnect")
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(reconnects).toBeGreaterThanOrEqual(2)
     } finally {
       pipeline.cleanup()
     }
