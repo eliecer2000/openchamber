@@ -1533,6 +1533,10 @@ async function main(options = {}) {
     dataDirectory: OPENCHAMBER_DATA_DIR,
     getServerId: () => relayServiceInstance?.getServerId?.() ?? null,
     resolveProjectDirectory,
+    broadcastProjection: (envelope, options) => broadcastGlobalUiEvent({
+      type: 'openchamber:codex-projection',
+      properties: envelope,
+    }, options),
   });
 
   // Same pattern for the tunnel runtime: created after the base routes so

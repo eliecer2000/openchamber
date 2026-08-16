@@ -1,7 +1,8 @@
 import { EventEmitter } from 'node:events';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createGlobalUiEventBroadcaster, createMessageStreamWsRuntime } from './runtime.js';
+import { MESSAGE_STREAM_WS_MAX_BUFFERED_BYTES } from './protocol.js';
 
 class FakeSocket extends EventEmitter {
   constructor() {
@@ -123,6 +124,34 @@ describe('event stream broadcaster', () => {
     broadcast({ type: 'openchamber:notification' });
 
     expect(wsClients.size).toBe(0);
+  });
+
+  it('returns bounded delivery truth and drops failed SSE and backpressured WS clients', () => {
+    const failedSse = {};
+    const sseClients = new Set([failedSse]);
+    const slowSocket = {
+      readyState: 1,
+      bufferedAmount: MESSAGE_STREAM_WS_MAX_BUFFERED_BYTES + 1,
+      close: vi.fn(),
+      send: vi.fn(),
+    };
+    const wsClients = new Set([slowSocket]);
+    const broadcast = createGlobalUiEventBroadcaster({
+      sseClients,
+      wsClients,
+      writeSseEvent() { throw new Error('closed SSE response'); },
+    });
+
+    const delivery = broadcast({
+      type: 'openchamber:codex-projection',
+      properties: { engine: 'codex', sessionID: 'session-1', revision: 1, changes: [{ kind: 'session.status', status: 'running' }] },
+    });
+
+    expect(delivery).toEqual({ sseSent: 0, wsSent: 0, dropped: 2, failed: true });
+    expect(sseClients.size).toBe(0);
+    expect(wsClients.size).toBe(0);
+    expect(slowSocket.close).toHaveBeenCalledWith(1013, 'Message stream client is too slow');
+    expect(slowSocket.send).not.toHaveBeenCalled();
   });
 });
 

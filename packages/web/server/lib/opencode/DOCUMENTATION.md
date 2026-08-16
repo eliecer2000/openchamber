@@ -50,7 +50,8 @@ This module provides OpenCode server integration utilities for the web server ru
 - `packages/web/server/lib/ui-auth/ui-auth.js`: UI session authentication runtime (outside OpenCode module).
 - `packages/web/server/lib/ui-auth/ui-passkeys.js`: UI passkey storage and WebAuthn registration/authentication helpers (outside OpenCode module).
 - `packages/web/server/lib/codex/routes.js`: Web Server-only Codex capability/session reads, deduplicated turn starts, exactly-once approval replies, and scoped idempotent abort with frozen launch eligibility; registered after API auth and before the generic OpenCode proxy.
-- `packages/web/server/lib/codex/event-translator.js`: explicit Codex 0.147.0 notification/request translation into revisioned, engine-tagged UI projections; malformed and unknown frames retain no raw payload.
+- `packages/web/server/lib/codex/event-translator.js`: explicit Codex 0.147.0 notification/request translation into revisionless projection changes; malformed and unknown frames retain no raw payload.
+- `packages/web/server/lib/codex/runtime.js`: sole projected-state and revision authority. Validated app-server notifications flow through the translator, then one atomic publication updates messages/parts/status/approvals/diff, appends an engine-tagged replay envelope (256 per session), and invokes the existing global UI broadcaster.
 
 ## Public exports (auth.js)
 - `readAuthFile()`: Reads and parses `~/.local/share/opencode/auth.json`.
@@ -319,6 +320,8 @@ Transport-triggered health checks share the periodic monitor's failure accountin
   - `gracefulShutdown(options?)`
 
 Codex abort ownership remains inside `CodexRuntime`: one atomic transition clears active-turn and approval ownership, terminalizes running tool items, sends `turn/interrupt`, and ignores late activity. Interrupt or process failure remains `failed` and triggers retryable app-server cleanup instead of publishing idle success.
+
+Codex projected reads are authenticated with the existing `/api` gate. `GET /api/codex/sessions/:id/messages` returns only the parsed projection snapshot; `?afterRevision=N` returns contiguous replay or `snapshot-required`. Production composition injects `broadcastGlobalUiEvent`, so `openchamber:codex-projection` uses the existing direct/relay WS and SSE clients, URL-token/origin checks, and slow-WS eviction without changing OpenCode upstream stream semantics. Broadcast failure never rolls back committed projection/replay state and is counted without logging event content.
 
 ## Public exports (server-startup-runtime.js)
 - `createServerStartupRuntime(dependencies)`: creates runtime for server bind/startup tunnel and process handler wiring.

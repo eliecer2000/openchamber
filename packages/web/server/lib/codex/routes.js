@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { CodexBindingStore } from './binding-store.js';
 import { CodexRuntime } from './runtime.js';
 
@@ -31,7 +32,8 @@ const statusForError = (error) => {
   if (error?.code === 'invalid-directory' || error?.code === 'non-canonical-directory' ||
     error?.code === 'directory-mismatch' || error?.code === 'invalid-binding' ||
     error?.code === 'invalid-turn-request' || error?.code === 'invalid-approval-decision' ||
-    error?.code === 'invalid-approval-request' || error?.code === 'invalid-abort-request') return 400;
+    error?.code === 'invalid-approval-request' || error?.code === 'invalid-abort-request' ||
+    error?.code === 'invalid-replay-revision') return 400;
   return 500;
 };
 
@@ -46,7 +48,8 @@ export const createCodexRoutesRuntime = ({
   runtimeName,
   apiOnly,
   bindingStore = null,
-  codexRuntime = new CodexRuntime(),
+  codexRuntime = null,
+  broadcastProjection,
   dataDirectory,
   getServerId = async () => null,
   resolveProjectDirectory = async () => null,
@@ -55,6 +58,7 @@ export const createCodexRoutesRuntime = ({
     ? { runtimeName: runtimeDescriptor.runtimeName, apiOnly: runtimeDescriptor.apiOnly }
     : { runtimeName, apiOnly };
   const eligibility = createEligibility(descriptor);
+  const runtime = codexRuntime ?? new CodexRuntime({ broadcastProjection });
   let store = bindingStore;
   let storePromise = null;
 
@@ -85,7 +89,7 @@ export const createCodexRoutesRuntime = ({
 
   const resolveScope = async (req) => {
     const authoritativeDirectory = await resolveProjectDirectory(req);
-    if (typeof authoritativeDirectory !== 'string' || !authoritativeDirectory) {
+    if (typeof authoritativeDirectory !== 'string' || !path.isAbsolute(authoritativeDirectory)) {
       const error = new Error('Codex project directory is required');
       error.code = 'invalid-directory';
       throw error;
@@ -114,7 +118,7 @@ export const createCodexRoutesRuntime = ({
     const scope = await resolveScope(req);
     const currentStore = await getBindingStore();
     const session = await currentStore.get({ sessionId: req.params.id, ...scope });
-    const state = codexRuntime.getState(session.sessionId)?.memory ?? null;
+    const state = runtime.getState(session.sessionId)?.memory ?? null;
     if (!state) {
       return { session, state: null };
     }
@@ -153,15 +157,29 @@ export const createCodexRoutesRuntime = ({
     }));
 
     app.get('/api/codex/sessions/:id/messages', run(async (req, res) => {
+      let afterRevision = null;
+      if (req.query.afterRevision !== undefined) {
+        const raw = Array.isArray(req.query.afterRevision) ? '' : req.query.afterRevision;
+        if (typeof raw !== 'string' || !/^(0|[1-9]\d*)$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+          const error = new Error('Codex replay revision is invalid');
+          error.code = 'invalid-replay-revision';
+          throw error;
+        }
+        afterRevision = Number(raw);
+      }
       const result = await readSession(req);
       if (!requireState(res, result)) return;
-      res.json({ revision: result.state.revision, transcript: result.state.transcript });
+      if (afterRevision !== null) {
+        res.json(runtime.replay(result.session.sessionId, afterRevision));
+        return;
+      }
+      res.json(runtime.projectionSnapshot(result.session.sessionId));
     }));
 
     app.get('/api/codex/sessions/:id/status', run(async (req, res) => {
       const result = await readSession(req);
       if (!requireState(res, result)) return;
-      const { revision, status, activeTurn, failure, recovery } = result.state;
+      const { revision, status, activeTurn, failure, recovery } = runtime.projectionSnapshot(result.session.sessionId);
       res.json({ revision, status, activeTurn, failure, recovery });
     }));
 
@@ -178,7 +196,7 @@ export const createCodexRoutesRuntime = ({
       const scope = await resolveScope(req);
       const currentStore = await getBindingStore();
       const binding = await currentStore.get({ sessionId: req.params.id, ...scope });
-      const accepted = await codexRuntime.startTurn(binding, {
+      const accepted = await runtime.startTurn(binding, {
         requestId: body.requestId,
         text: body.text,
         bindThread: ({ threadId }) => currentStore.bindThread({
@@ -205,7 +223,7 @@ export const createCodexRoutesRuntime = ({
       const scope = await resolveScope(req);
       const currentStore = await getBindingStore();
       const binding = await currentStore.get({ sessionId: req.params.id, ...scope });
-      const result = await codexRuntime.replyApproval(binding, {
+      const result = await runtime.replyApproval(binding, {
         requestId: req.params.requestId,
         decision: body.decision,
         threadId: body.threadId,
@@ -225,13 +243,13 @@ export const createCodexRoutesRuntime = ({
       const scope = await resolveScope(req);
       const currentStore = await getBindingStore();
       const binding = await currentStore.get({ sessionId: req.params.id, ...scope });
-      res.json(await codexRuntime.abort(binding));
+      res.json(await runtime.abort(binding));
     }));
   };
 
   return {
     eligibility,
     registerRoutes,
-    shutdown: () => codexRuntime.shutdown(),
+    shutdown: () => runtime.shutdown(),
   };
 };

@@ -2,6 +2,7 @@ const isRecord = (value) => value !== null && typeof value === 'object' && !Arra
 const isText = (value) => typeof value === 'string' && value.length > 0;
 const messageId = (turnId) => `msg_codex_${turnId}`;
 const partId = (itemId) => `prt_codex_${itemId}`;
+const fileStatus = (kind) => ({ add: 'added', delete: 'deleted', update: 'modified' })[kind] ?? 'modified';
 
 const assistantMessage = (sessionId, turnId, directory, created, completed, error) => ({
   id: messageId(turnId), sessionID: sessionId, role: 'assistant', parentID: '',
@@ -46,7 +47,22 @@ const toolPart = (sessionId, turnId, item, now, completedAt) => {
 
 const fileDiffs = (changes) => changes
   .filter((change) => isRecord(change) && isText(change.path) && typeof change.diff === 'string')
-  .map((change) => ({ file: change.path, status: isText(change.kind) ? change.kind : 'modified', patch: change.diff }));
+  .filter((change) => change.diff.length > 0)
+  .map((change) => ({ file: change.path, status: fileStatus(change.kind), patch: change.diff }));
+
+export const parseCodexTurnDiff = (diff) => {
+  const starts = [...diff.matchAll(/^diff --git /gm)].map((match) => match.index);
+  if (starts.length === 0) return [{ status: 'modified', patch: diff }];
+  return starts.map((start, index) => {
+    const patch = diff.slice(start, starts[index + 1] ?? diff.length).replace(/\n$/, '');
+    const file = patch.match(/^\+\+\+ b\/(.+)$/m)?.[1]
+      ?? patch.match(/^--- a\/(.+)$/m)?.[1]
+      ?? '';
+    const status = /^new file mode /m.test(patch) ? 'added'
+      : /^deleted file mode /m.test(patch) ? 'deleted' : 'modified';
+    return { file, status, patch };
+  });
+};
 
 const itemChanges = (item, params, context, completedAt) => {
   if (!isRecord(item) || !isText(item.id) || !isText(item.type)) return null;
@@ -64,9 +80,10 @@ const itemChanges = (item, params, context, completedAt) => {
     return [{ kind: 'part.upsert', part: toolPart(sessionId, turnId, item, now, completedAt) }];
   }
   if (item.type === 'fileChange' && Array.isArray(item.changes)) {
+    const diff = fileDiffs(item.changes);
     return [
       { kind: 'part.upsert', part: toolPart(sessionId, turnId, item, now, completedAt) },
-      { kind: 'session.diff', diff: fileDiffs(item.changes) },
+      ...(diff.length > 0 ? [{ kind: 'session.diff', diff }] : []),
     ];
   }
   return null;
@@ -74,7 +91,7 @@ const itemChanges = (item, params, context, completedAt) => {
 
 export function translateCodexEvent(frame, context) {
   if (!isRecord(frame) || !isText(frame.method) || !isRecord(frame.params) ||
-    !isRecord(context) || !isText(context.sessionId) || !Number.isSafeInteger(context.revision) || context.revision <= 0) {
+    !isRecord(context) || !isText(context.sessionId)) {
     return { accepted: false, reason: 'malformed-event' };
   }
   const params = frame.params;
@@ -87,6 +104,7 @@ export function translateCodexEvent(frame, context) {
     const created = Number.isFinite(params.turn.startedAt) ? params.turn.startedAt * 1000 : now;
     changes = [
       { kind: 'message.upsert', message: assistantMessage(context.sessionId, params.turn.id, directory, created) },
+      { kind: 'turn.changed', turn: { id: params.turn.id, threadId: params.threadId ?? null } },
       { kind: 'session.status', status: 'running' },
     ];
   } else if (frame.method === 'turn/completed' && isText(params.turn?.id) && isText(params.turn.status)) {
@@ -95,6 +113,7 @@ export function translateCodexEvent(frame, context) {
     const error = params.turn.status === 'failed' ? params.turn.error?.message ?? 'Codex turn failed' : null;
     changes = [
       { kind: 'message.upsert', message: { ...assistantMessage(context.sessionId, params.turn.id, directory, created, completed, error), finish: params.turn.status } },
+      { kind: 'turn.changed', turn: null },
       { kind: 'session.status', status: error ? 'failed' : 'idle' },
     ];
   } else if (base && frame.method === 'item/agentMessage/delta' && isText(params.itemId) && typeof params.delta === 'string') {
@@ -135,7 +154,7 @@ export function translateCodexEvent(frame, context) {
       { kind: 'session.status', status: 'waiting_approval' },
     ];
   } else if (base && frame.method === 'turn/diff/updated' && typeof params.diff === 'string') {
-    changes = [{ kind: 'session.diff', diff: [{ status: 'modified', patch: params.diff }] }];
+    changes = [{ kind: 'session.diff', diff: parseCodexTurnDiff(params.diff) }];
   } else if (base && frame.method === 'error' && typeof params.error?.message === 'string') {
     changes = [
       { kind: 'message.error', message: assistantMessage(context.sessionId, params.turnId, directory, now, now, params.error.message) },
@@ -150,5 +169,5 @@ export function translateCodexEvent(frame, context) {
       'item/fileChange/requestApproval', 'turn/diff/updated', 'error'].includes(frame.method);
     return { accepted: false, reason: known ? 'malformed-event' : 'unknown-event' };
   }
-  return { accepted: true, event: { engine: 'codex', sessionID: context.sessionId, revision: context.revision, changes } };
+  return { accepted: true, changes };
 }

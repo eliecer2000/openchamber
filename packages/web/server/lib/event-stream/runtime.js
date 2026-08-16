@@ -21,17 +21,23 @@ export function createGlobalUiEventBroadcaster({
   writeSseEvent,
 }) {
   return (payload, options = {}) => {
+    let sseSent = 0;
+    let wsSent = 0;
+    let dropped = 0;
     const hasSseClients = sseClients.size > 0;
     const hasWsClients = wsClients.size > 0;
     if (!hasSseClients && !hasWsClients) {
-      return;
+      return { sseSent, wsSent, dropped, failed: false };
     }
 
     if (hasSseClients) {
       for (const res of sseClients) {
         try {
           writeSseEvent(res, payload);
+          sseSent += 1;
         } catch {
+          sseClients.delete(res);
+          dropped += 1;
         }
       }
     }
@@ -44,9 +50,13 @@ export function createGlobalUiEventBroadcaster({
         });
         if (!sent) {
           wsClients.delete(socket);
+          dropped += 1;
+        } else {
+          wsSent += 1;
         }
       }
     }
+    return { sseSent, wsSent, dropped, failed: dropped > 0 };
   };
 }
 

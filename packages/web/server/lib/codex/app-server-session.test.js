@@ -141,6 +141,23 @@ describe('CodexAppServerSession', () => {
     await session.shutdown();
   });
 
+  it('forwards validated notifications without exposing raw frames elsewhere', async () => {
+    const child = createChild();
+    const onNotification = vi.fn();
+    const session = new CodexAppServerSession({ directory: '/workspace', spawn: () => child, onNotification });
+    await session.start();
+    const notification = {
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: 'hello' },
+    };
+
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify(notification)}\n`));
+
+    expect(onNotification).toHaveBeenCalledOnce();
+    expect(onNotification).toHaveBeenCalledWith(notification);
+    await session.shutdown();
+  });
+
   it('sends an authoritative turn interrupt and retries cleanup after a partial failure', async () => {
     const child = createChild();
     const originalKill = child.kill;

@@ -12,6 +12,7 @@ const createHarness = ({
   apiOnly = false,
   bindingStore = {},
   codexRuntime = {},
+  resolveProjectDirectory = async () => WORKSPACE,
 } = {}) => {
   const app = express();
   const proxy = vi.fn((_req, res) => res.status(599).json({ proxied: true }));
@@ -25,7 +26,7 @@ const createHarness = ({
     apiOnly,
     bindingStore,
     codexRuntime,
-    resolveProjectDirectory: async () => WORKSPACE,
+    resolveProjectDirectory,
   });
   routes.registerRoutes(app);
   app.use('/api', proxy);
@@ -143,7 +144,17 @@ describe('Codex Web Server routes', () => {
       recovery: { kind: 'memory' },
     };
     const bindingStore = { get: vi.fn(async () => binding) };
-    const codexRuntime = { getState: vi.fn(() => ({ status: 'ready', error: null, memory })) };
+    const projection = {
+      engine: 'codex', sessionID: SESSION_ID, revision: 3,
+      messages: [{ id: 'message-1' }], parts: [{ id: 'part-1', messageID: 'message-1' }],
+      status: 'running', pendingApprovals: [], diff: [], activeTurn: { id: 'turn-1' },
+      failure: null, recovery: { kind: 'memory' },
+    };
+    const codexRuntime = {
+      getState: vi.fn(() => ({ status: 'ready', error: null, memory })),
+      projectionSnapshot: vi.fn(() => projection),
+      replay: vi.fn(() => ({ kind: 'events', fromRevision: 2, toRevision: 3, events: [{ revision: 3 }] })),
+    };
     const { app } = createHarness({ bindingStore, codexRuntime });
     const auth = { Authorization: 'Bearer valid' };
 
@@ -152,7 +163,7 @@ describe('Codex Web Server routes', () => {
     const status = await request(app).get(`/api/codex/sessions/${SESSION_ID}/status`).set(auth).expect(200);
 
     expect(session.body).toEqual({ session: binding, state: memory });
-    expect(messages.body).toEqual({ revision: 3, transcript: memory.transcript });
+    expect(messages.body).toEqual(projection);
     expect(status.body).toEqual({
       revision: 3,
       status: 'running',
@@ -160,6 +171,41 @@ describe('Codex Web Server routes', () => {
       failure: null,
       recovery: { kind: 'memory' },
     });
+
+    const replay = await request(app)
+      .get(`/api/codex/sessions/${SESSION_ID}/messages?afterRevision=2`)
+      .set(auth)
+      .expect(200);
+    expect(replay.body).toEqual({ kind: 'events', fromRevision: 2, toRevision: 3, events: [{ revision: 3 }] });
+    expect(codexRuntime.replay).toHaveBeenCalledWith(SESSION_ID, 2);
+  });
+
+  it('rejects malformed replay revisions and non-absolute authoritative cwd before store access', async () => {
+    const bindingStore = { get: vi.fn(async () => ({ sessionId: SESSION_ID })) };
+    const codexRuntime = {
+      getState: vi.fn(() => ({ status: 'ready', memory: { revision: 0 } })),
+      projectionSnapshot: vi.fn(),
+    };
+    const { app } = createHarness({
+      bindingStore,
+      codexRuntime,
+      resolveProjectDirectory: async () => 'relative/workspace',
+    });
+    const auth = { Authorization: 'Bearer valid' };
+
+    await request(app).get(`/api/codex/sessions/${SESSION_ID}/messages`).set(auth).expect(400);
+    expect(bindingStore.get).not.toHaveBeenCalled();
+
+    const absolute = createHarness({
+      bindingStore,
+      codexRuntime,
+      resolveProjectDirectory: async () => WORKSPACE,
+    });
+    await request(absolute.app)
+      .get(`/api/codex/sessions/${SESSION_ID}/messages?afterRevision=1.5`)
+      .set(auth)
+      .expect(400);
+    expect(codexRuntime.projectionSnapshot).not.toHaveBeenCalled();
   });
 
   it('keeps missing authoritative memory explicit instead of returning idle or empty state', async () => {

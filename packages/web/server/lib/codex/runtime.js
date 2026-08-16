@@ -1,8 +1,11 @@
 import { CodexAppServerSession } from './app-server-session.js';
+import { parseCodexTurnDiff, translateCodexEvent } from './event-translator.js';
 
 const DEFAULT_IDLE_MS = 30 * 60 * 1000;
 const DEFAULT_REPLAY_EVENTS = 256;
 const MAX_DEDUPE_RECORDS = 128;
+const MAX_PROJECTED_DIFF_BYTES = 8 * 1024 * 1024;
+const MAX_PROJECTED_DIFF_FILES = 512;
 const STATUSES = new Set(['idle', 'starting', 'running', 'waiting_approval', 'interrupting', 'failed']);
 const TERMINAL_TURNS = new Set(['completed', 'interrupted', 'failed']);
 const APPROVAL_METHODS = new Map([
@@ -23,6 +26,26 @@ const fail = (code, message) => { throw new CodexRuntimeStateError(code, message
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isId = (value) => typeof value === 'string' && value.length > 0 && !/[\r\n]/.test(value);
 const clone = (value) => structuredClone(value);
+const replaceById = (values, value) => {
+  const index = values.findIndex((candidate) => candidate.id === value.id);
+  if (index < 0) values.push(clone(value));
+  else values[index] = clone(value);
+};
+const upsertProjectionPart = (values, value) => {
+  const index = values.findIndex((candidate) => candidate.id === value.id);
+  if (index < 0) {
+    values.push(clone(value));
+    return;
+  }
+  const existing = values[index];
+  const next = clone(value);
+  if (typeof existing.text === 'string' && existing.text && next.text === '') next.text = existing.text;
+  if (isObject(existing.state) && isObject(next.state) && typeof existing.state.output === 'string' &&
+    (!Object.hasOwn(next.state, 'output') || next.state.output === '')) {
+    next.state = { ...next.state, output: existing.state.output };
+  }
+  values[index] = next;
+};
 const textInput = (text) => [{ type: 'text', text, text_elements: [] }];
 const terminalizeItem = (value) => {
   const next = clone(value);
@@ -32,6 +55,27 @@ const terminalizeItem = (value) => {
     item.state = { ...item.state, status: 'error', error: 'Interrupted' };
   }
   return next;
+};
+const terminalizeProjectionParts = (parts) => parts
+  .filter((part) => isObject(part.state) && ACTIVE_ITEM_STATUSES.has(part.state.status))
+  .map(terminalizeItem);
+
+const readAuthoritativeWorkingTreeDiff = async (directory) => {
+  const { getDiff, getUntrackedDiffs, listUntrackedPaths } = await import('../git/service.js');
+  const [unstaged, staged, untrackedPaths] = await Promise.all([
+    getDiff(directory),
+    getDiff(directory, { staged: true }),
+    listUntrackedPaths(directory),
+  ]);
+  if (untrackedPaths.length > MAX_PROJECTED_DIFF_FILES) {
+    throw new Error('Codex working-tree projection exceeded the file limit');
+  }
+  const untracked = await getUntrackedDiffs(directory, untrackedPaths);
+  const patches = [unstaged, staged, ...untracked].filter((patch) => typeof patch === 'string' && patch.length > 0);
+  if (patches.reduce((bytes, patch) => bytes + Buffer.byteLength(patch), 0) > MAX_PROJECTED_DIFF_BYTES) {
+    throw new Error('Codex working-tree projection exceeded the byte limit');
+  }
+  return patches.flatMap(parseCodexTurnDiff);
 };
 
 class ReplayBuffer {
@@ -77,6 +121,7 @@ const createMemory = () => ({
   activeTurn: null,
   failure: null,
   recovery: { kind: 'memory' },
+  projection: { messages: [], parts: [], diff: [] },
 });
 
 const publicSnapshot = (memory) => ({
@@ -88,6 +133,45 @@ const publicSnapshot = (memory) => ({
   failure: clone(memory.failure),
   recovery: clone(memory.recovery),
 });
+
+const projectionSnapshot = (sessionId, memory) => ({
+  engine: 'codex',
+  sessionID: sessionId,
+  revision: memory.revision,
+  messages: clone(memory.projection.messages),
+  parts: clone(memory.projection.parts),
+  status: memory.status,
+  pendingApprovals: clone([...memory.pendingApprovals.values()]),
+  diff: clone(memory.projection.diff),
+  activeTurn: clone(memory.activeTurn),
+  failure: clone(memory.failure),
+  recovery: clone(memory.recovery),
+});
+
+const validateProjectionChange = (change) => {
+  if (!isObject(change) || !isId(change.kind)) return false;
+  if (change.kind === 'message.upsert' || change.kind === 'message.error') {
+    return isObject(change.message) && isId(change.message.id);
+  }
+  if (change.kind === 'part.upsert') {
+    return isObject(change.part) && isId(change.part.id) && isId(change.part.messageID);
+  }
+  if (change.kind === 'part.delta') {
+    return isId(change.messageID) && isId(change.partID) && ['text', 'output'].includes(change.field)
+      && typeof change.delta === 'string';
+  }
+  if (change.kind === 'tool.output.delta') {
+    return isId(change.messageID) && isId(change.partID) && typeof change.delta === 'string';
+  }
+  if (change.kind === 'session.status') return STATUSES.has(change.status);
+  if (change.kind === 'session.diff') return Array.isArray(change.diff);
+  if (change.kind === 'approval.pending') return isObject(change.approval) && isId(change.approval.id);
+  if (change.kind === 'approval.resolved') return isId(change.requestId);
+  if (change.kind === 'turn.changed') {
+    return change.turn === null || (isObject(change.turn) && isId(change.turn.id));
+  }
+  return false;
+};
 
 const validateSnapshot = (snapshot) => {
   if (!isObject(snapshot) || !Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0 ||
@@ -110,12 +194,15 @@ const validateSnapshot = (snapshot) => {
     activeTurn: clone(snapshot.activeTurn),
     failure: null,
     recovery: { kind: 'memory' },
+    projection: { messages: [], parts: [], diff: [] },
   };
 };
 
 export class CodexRuntime {
   constructor({
     createSession = (options) => new CodexAppServerSession(options),
+    broadcastProjection = () => undefined,
+    readWorkingTreeDiff = readAuthoritativeWorkingTreeDiff,
     idleMs = DEFAULT_IDLE_MS,
     maxReplayEvents = DEFAULT_REPLAY_EVENTS,
   } = {}) {
@@ -123,19 +210,31 @@ export class CodexRuntime {
       throw new TypeError('maxReplayEvents must be a positive safe integer');
     }
     this.createSession = createSession;
+    this.broadcastProjection = broadcastProjection;
+    this.readWorkingTreeDiff = readWorkingTreeDiff;
     this.idleMs = idleMs;
     this.maxReplayEvents = maxReplayEvents;
     this.entries = new Map();
+    this.projectionMetrics = {
+      translated: 0,
+      rejected: 0,
+      published: 0,
+      broadcastFailures: 0,
+      droppedClients: 0,
+      replayMisses: 0,
+    };
   }
 
   async open(sessionId, directory) {
     const existing = this.entries.get(sessionId);
     if (existing) {
+      if (existing.status === 'starting') return existing.opening;
       if (existing.status === 'failed') throw existing.error;
       return existing.session;
     }
     const entry = {
       session: null,
+      opening: null,
       status: 'starting',
       error: null,
       active: false,
@@ -145,26 +244,29 @@ export class CodexRuntime {
       processDisposed: false,
       abortClaim: null,
       directory,
+      sessionId,
       threadId: null,
       turnRequests: new Map(),
       approvalReplies: new Map(),
+      turnDiffObserved: false,
+      terminalNotification: null,
       memory: createMemory(),
       replay: new ReplayBuffer(this.maxReplayEvents),
     };
     const session = this.createSession({
       directory,
       onExit: (error) => this.handleExit(sessionId, error),
+      onNotification: (notification) => this.handleNotification(sessionId, notification),
       onRequest: (request) => this.handleRequest(sessionId, request),
     });
     entry.session = session;
     this.entries.set(sessionId, entry);
-    try {
-      await session.start();
+    entry.opening = Promise.resolve().then(() => session.start()).then(() => {
       entry.status = 'ready';
       entry.memory.status = 'idle';
       this.scheduleIdle(sessionId, entry);
       return session;
-    } catch (error) {
+    }).catch((error) => {
       entry.status = 'failed';
       entry.error = error;
       entry.memory.status = 'failed';
@@ -172,7 +274,8 @@ export class CodexRuntime {
       entry.memory.failure = { code: 'process-start-failed', message: 'Codex app-server failed to start' };
       entry.memory.recovery = { kind: 'failed' };
       throw error;
-    }
+    });
+    return entry.opening;
   }
 
   async startTurn(binding, { requestId, text, bindThread }) {
@@ -181,6 +284,7 @@ export class CodexRuntime {
       typeof text !== 'string' || !text.trim() || typeof bindThread !== 'function') {
       fail('invalid-turn-request', 'Codex turn request is invalid');
     }
+    await this.open(binding.sessionId, binding.directory);
     const entry = this.requireReady(binding.sessionId);
     if (entry.abortClaim) {
       if (!entry.abortClaim.settled) fail('turn-active', 'Codex session abort is still active');
@@ -226,6 +330,8 @@ export class CodexRuntime {
         if (resumed?.thread?.id !== threadId) fail('binding-conflict', 'Codex resumed a different thread');
       }
       entry.threadId = threadId;
+      entry.turnDiffObserved = false;
+      entry.terminalNotification = null;
       const started = await entry.session.turn('turn/start', { threadId, input: textInput(text) });
       const turnId = started?.turn?.id;
       if (!isId(turnId)) fail('turn-start-ambiguous', 'Codex turn start was not authoritative');
@@ -241,6 +347,139 @@ export class CodexRuntime {
         : new CodexRuntimeStateError('turn-start-ambiguous', 'Codex turn start outcome is ambiguous');
       throw error;
     }
+  }
+
+  handleNotification(sessionId, frame) {
+    const entry = this.entries.get(sessionId);
+    if (!entry || entry.status !== 'ready' || entry.abortClaim) return;
+    const translated = translateCodexEvent(frame, {
+      sessionId,
+      directory: entry.directory,
+      now: Date.now(),
+    });
+    if (!translated.accepted) {
+      this.projectionMetrics.rejected += 1;
+      return;
+    }
+    this.projectionMetrics.translated += 1;
+    if (frame.method === 'turn/completed') {
+      if (!entry.terminalNotification) {
+        entry.terminalNotification = this.publishTerminalNotification(sessionId, entry, frame, translated.changes);
+      }
+      return entry.terminalNotification;
+    }
+    this.publishProjection(sessionId, translated.changes);
+    if (translated.changes.some((change) => change.kind === 'session.diff')) entry.turnDiffObserved = true;
+    if (frame.method === 'turn/started') {
+      entry.active = true;
+      this.clearIdle(entry);
+    } else if (frame.method === 'error' && frame.params?.willRetry !== true) {
+      entry.active = false;
+      this.scheduleIdle(sessionId, entry);
+    }
+  }
+
+  async publishTerminalNotification(sessionId, entry, frame, terminalChanges) {
+    let diff = null;
+    let diffFailure = false;
+    if (!entry.turnDiffObserved) {
+      try {
+        diff = await this.readWorkingTreeDiff(entry.directory);
+      } catch {
+        diffFailure = true;
+      }
+    }
+    if (this.entries.get(sessionId) !== entry || entry.status !== 'ready' || entry.abortClaim ||
+      entry.memory.activeTurn?.id !== frame.params?.turn?.id) {
+      return { applied: false, reason: 'stale-terminal', revision: entry.memory.revision };
+    }
+
+    const changes = [
+      ...(Array.isArray(diff) && diff.length > 0 ? [{ kind: 'session.diff', diff }] : []),
+      ...terminalChanges.map((change) => (
+        diffFailure && change.kind === 'session.status' ? { ...change, status: 'failed' } : change
+      )),
+    ];
+    const published = this.publishEntry(entry, changes, () => {
+      entry.memory.failure = diffFailure
+        ? { code: 'diff-read-failed', message: 'Codex working-tree projection failed' }
+        : null;
+    });
+    entry.active = false;
+    this.scheduleIdle(sessionId, entry);
+    return published;
+  }
+
+  publishProjection(sessionId, changes) {
+    const entry = this.requireReady(sessionId);
+    return this.publishEntry(entry, changes);
+  }
+
+  publishEntry(entry, changes, mutate = () => {}) {
+    if (!Array.isArray(changes) || changes.length === 0 || changes.some((change) => !validateProjectionChange(change))) {
+      fail('invalid-projection', 'Codex projection changes are invalid');
+    }
+    for (const change of changes) this.applyProjectionChange(entry, change);
+    mutate();
+    entry.memory.revision += 1;
+    const envelope = Object.freeze({
+      engine: 'codex',
+      sessionID: entry.sessionId,
+      revision: entry.memory.revision,
+      changes: clone(changes),
+    });
+    entry.replay.push(envelope);
+    this.projectionMetrics.published += 1;
+
+    let broadcastFailed = false;
+    try {
+      const delivery = this.broadcastProjection(envelope, { directory: entry.directory });
+      broadcastFailed = delivery?.failed === true;
+      this.projectionMetrics.droppedClients += Number.isSafeInteger(delivery?.dropped) ? delivery.dropped : 0;
+    } catch {
+      broadcastFailed = true;
+    }
+    if (broadcastFailed) this.projectionMetrics.broadcastFailures += 1;
+    return { applied: true, revision: envelope.revision, broadcastFailed };
+  }
+
+  applyProjectionChange(entry, change) {
+    const projection = entry.memory.projection;
+    if (change.kind === 'message.upsert' || change.kind === 'message.error') {
+      replaceById(projection.messages, change.message);
+      return;
+    }
+    if (change.kind === 'part.upsert') {
+      upsertProjectionPart(projection.parts, change.part);
+      return;
+    }
+    if (change.kind === 'part.delta' || change.kind === 'tool.output.delta') {
+      const index = projection.parts.findIndex((part) => part.id === change.partID && part.messageID === change.messageID);
+      if (index < 0) return;
+      const part = projection.parts[index];
+      if (change.kind === 'part.delta') {
+        projection.parts[index] = { ...part, [change.field]: `${part[change.field] ?? ''}${change.delta}` };
+      } else {
+        projection.parts[index] = {
+          ...part,
+          state: { ...(isObject(part.state) ? part.state : {}), output: `${part.state?.output ?? ''}${change.delta}` },
+        };
+      }
+      return;
+    }
+    if (change.kind === 'session.status') entry.memory.status = change.status;
+    else if (change.kind === 'session.diff') projection.diff = clone(change.diff);
+    else if (change.kind === 'approval.pending') {
+      const requestId = change.approval.requestId ?? change.approval.id;
+      if (!entry.memory.pendingApprovals.has(requestId)) {
+        entry.memory.pendingApprovals.set(requestId, clone(change.approval));
+      }
+    } else if (change.kind === 'approval.resolved') entry.memory.pendingApprovals.delete(change.requestId);
+    else if (change.kind === 'turn.changed') entry.memory.activeTurn = clone(change.turn);
+  }
+
+  getProjectionMetrics() {
+    return { ...this.projectionMetrics };
   }
 
   handleRequest(sessionId, frame) {
@@ -363,12 +602,14 @@ export class CodexRuntime {
     }
 
     const approvals = [...entry.memory.pendingApprovals.values()];
-    this.commit(entry, { type: 'turn.abort.requested', turnId: turn.id }, () => {
+    const terminalParts = terminalizeProjectionParts(entry.memory.projection.parts);
+    this.commit(entry, { type: 'turn.abort.requested', turnId: turn.id, terminalParts }, () => {
       entry.active = false;
       entry.memory.status = 'interrupting';
       entry.memory.activeTurn = null;
       entry.memory.pendingApprovals.clear();
       entry.memory.transcript.items = entry.memory.transcript.items.map(terminalizeItem);
+      for (const part of terminalParts) replaceById(entry.memory.projection.parts, part);
     });
     const claim = {
       settled: false,
@@ -490,6 +731,12 @@ export class CodexRuntime {
     return publicSnapshot(entry.memory);
   }
 
+  projectionSnapshot(sessionId) {
+    const entry = this.entries.get(sessionId);
+    if (!entry) fail('session-not-found', 'Codex session memory was not found');
+    return projectionSnapshot(sessionId, entry.memory);
+  }
+
   applySnapshot(sessionId, snapshot) {
     const entry = this.requireReady(sessionId);
     const next = validateSnapshot(snapshot);
@@ -542,9 +789,25 @@ export class CodexRuntime {
 
   commit(entry, event, mutate) {
     mutate();
-    entry.memory.revision += 1;
-    entry.replay.push({ revision: entry.memory.revision, event: clone(event) });
-    return { applied: true, revision: entry.memory.revision };
+    let changes;
+    if (event.type === 'approval.pending') changes = [{
+      kind: 'approval.pending',
+      approval: { ...event.approval, id: event.approval.id ?? event.approval.requestId },
+    }];
+    else if (event.type === 'approval.resolved') changes = [{ kind: 'approval.resolved', requestId: event.requestId }];
+    else if (event.type === 'turn.changed') changes = [
+      { kind: 'turn.changed', turn: event.turn },
+      { kind: 'session.status', status: entry.memory.status },
+    ];
+    else if (event.type === 'turn.abort.requested' || event.type === 'process.failed') changes = [
+      ...(Array.isArray(event.terminalParts)
+        ? event.terminalParts.map((part) => ({ kind: 'part.upsert', part }))
+        : []),
+      { kind: 'turn.changed', turn: null },
+      { kind: 'session.status', status: entry.memory.status },
+    ];
+    else changes = [{ kind: 'session.status', status: entry.memory.status }];
+    return this.publishEntry(entry, changes);
   }
 
   replay(sessionId, afterRevision) {
@@ -555,7 +818,8 @@ export class CodexRuntime {
     }
     const first = entry.replay.firstRevision();
     if (afterRevision < entry.memory.revision && (first === null || afterRevision < first - 1)) {
-      return { kind: 'snapshot-required', snapshot: publicSnapshot(entry.memory) };
+      this.projectionMetrics.replayMisses += 1;
+      return { kind: 'snapshot-required', snapshot: projectionSnapshot(sessionId, entry.memory) };
     }
     return {
       kind: 'events',
@@ -653,11 +917,13 @@ export class CodexRuntime {
     entry.active = false;
     entry.status = 'failed';
     entry.error = error;
-    this.commit(entry, { type: 'process.failed', code: error?.code ?? 'process-exit' }, () => {
+    const terminalParts = terminalizeProjectionParts(entry.memory.projection.parts);
+    this.commit(entry, { type: 'process.failed', code: error?.code ?? 'process-exit', terminalParts }, () => {
       entry.memory.status = 'failed';
       entry.memory.activeTurn = null;
       entry.memory.pendingApprovals.clear();
       entry.memory.transcript.items = entry.memory.transcript.items.map(terminalizeItem);
+      for (const part of terminalParts) replaceById(entry.memory.projection.parts, part);
       entry.memory.failure = { code: error?.code ?? 'process-exit', message: 'Codex app-server process failed' };
       entry.memory.recovery = { kind: 'failed' };
     });

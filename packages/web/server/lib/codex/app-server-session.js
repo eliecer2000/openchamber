@@ -27,6 +27,7 @@ export class CodexAppServerSession {
     shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
     stderrLimitBytes = DEFAULT_STDERR_LIMIT_BYTES,
     onExit = () => {},
+    onNotification = () => {},
     onRequest = () => {},
   }) {
     if (!path.isAbsolute(directory)) throw new TypeError('Codex app-server directory must be absolute');
@@ -38,6 +39,7 @@ export class CodexAppServerSession {
     this.shutdownTimeoutMs = shutdownTimeoutMs;
     this.stderrLimitBytes = stderrLimitBytes;
     this.onExit = onExit;
+    this.onNotification = onNotification;
     this.onRequest = onRequest;
     this.state = 'new';
     this.stderrBytes = 0;
@@ -77,6 +79,7 @@ export class CodexAppServerSession {
           child.stdin.write(frame);
         },
         onProtocolError: (error) => this.handleProtocolFailure(error),
+        onNotification: (notification) => this.onNotification(notification),
         onRequest: (request) => this.onRequest(request),
       });
       child.stdout?.on('data', (chunk) => this.client.push(chunk));

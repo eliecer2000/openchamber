@@ -42,8 +42,9 @@ const turnBinding = (threadId = null) => ({
   threadId,
 });
 
-const openTurnRuntime = async ({ turn, control, respond } = {}) => {
+const openTurnRuntime = async ({ turn, control, respond, readWorkingTreeDiff } = {}) => {
   let requestHandler;
+  let notificationHandler;
   const session = {
     start: vi.fn(async () => {}),
     shutdown: vi.fn(async () => {}),
@@ -56,14 +57,21 @@ const openTurnRuntime = async ({ turn, control, respond } = {}) => {
     interrupt: vi.fn(async () => ({ turn: { id: 'turn-1', status: 'interrupted' } })),
   };
   const runtime = new CodexRuntime({
-    createSession: ({ onRequest }) => {
+    createSession: ({ onRequest, onNotification }) => {
       requestHandler = onRequest;
+      notificationHandler = onNotification;
       return session;
     },
+    ...(readWorkingTreeDiff ? { readWorkingTreeDiff } : {}),
     idleMs: 60_000,
   });
   await runtime.open('session-1', '/workspace');
-  return { runtime, session, emitRequest: (frame) => requestHandler(frame) };
+  return {
+    runtime,
+    session,
+    emitRequest: (frame) => requestHandler(frame),
+    emitNotification: (frame) => notificationHandler(frame),
+  };
 };
 
 describe('CodexRuntime abort ownership', () => {
@@ -79,6 +87,11 @@ describe('CodexRuntime abort ownership', () => {
       { id: 'command-1', type: 'commandExecution', status: 'running' },
       { id: 'edit-1', type: 'fileChange', status: 'pending' },
     ]) runtime.record('session-1', { type: 'transcript.append', item });
+    runtime.publishProjection('session-1', [
+      projectionTool('tool-1', 'running'),
+      projectionTool('command-1', 'running'),
+      projectionTool('edit-1', 'pending'),
+    ]);
     emitRequest(approvalFrame());
 
     const first = runtime.abort(turnBinding('thread-1'));
@@ -96,6 +109,8 @@ describe('CodexRuntime abort ownership', () => {
     expect(session.respondError).toHaveBeenCalledTimes(1);
     expect(runtime.snapshot('session-1').transcript.items.map((item) => item.status))
       .toEqual(['interrupted', 'interrupted', 'interrupted']);
+    expect(runtime.projectionSnapshot('session-1').parts.map((part) => part.state.status))
+      .toEqual(['error', 'error', 'error']);
 
     const revision = runtime.snapshot('session-1').revision;
     expect(runtime.record('session-1', { type: 'status.changed', status: 'running' }))
@@ -183,9 +198,64 @@ describe('CodexRuntime abort ownership', () => {
       status: 'failed', activeTurn: null, pendingApprovals: [],
     });
   });
+
+  it('terminalizes projected work when the process exits', async () => {
+    let exit;
+    const session = createSession();
+    const runtime = new CodexRuntime({
+      createSession: ({ onExit }) => { exit = onExit; return session; },
+      idleMs: 60_000,
+    });
+    await runtime.open('session-1', '/workspace');
+    runtime.publishProjection('session-1', [projectionTool('command-1', 'running')]);
+
+    exit(Object.assign(new Error('private process detail'), { code: 'process-exit' }));
+
+    expect(runtime.projectionSnapshot('session-1')).toMatchObject({
+      status: 'failed',
+      parts: [{ id: 'prt_codex_command-1', state: { status: 'error', error: 'Interrupted' } }],
+    });
+  });
 });
 
 describe('CodexRuntime turn ownership', () => {
+  it('opens the production app-server session before starting the first turn', async () => {
+    const session = {
+      start: vi.fn(async () => {}),
+      shutdown: vi.fn(async () => {}),
+      control: vi.fn(async () => ({ thread: { id: 'thread-1' } })),
+      turn: vi.fn(async () => ({ turn: { id: 'turn-1' } })),
+    };
+    const runtime = new CodexRuntime({ createSession: () => session, idleMs: 60_000 });
+
+    await expect(runtime.startTurn(turnBinding('thread-1'), {
+      requestId: 'request-first', text: 'hello', bindThread: vi.fn(),
+    })).resolves.toMatchObject({ turnId: 'turn-1', revision: 1 });
+
+    expect(session.start).toHaveBeenCalledOnce();
+    expect(session.turn).toHaveBeenCalledOnce();
+  });
+
+  it('shares one lazy app-server open across concurrent first-turn retries', async () => {
+    const opening = deferred();
+    const session = {
+      start: vi.fn(() => opening.promise),
+      shutdown: vi.fn(async () => {}),
+      control: vi.fn(async () => ({ thread: { id: 'thread-1' } })),
+      turn: vi.fn(async () => ({ turn: { id: 'turn-1' } })),
+    };
+    const runtime = new CodexRuntime({ createSession: () => session, idleMs: 60_000 });
+    const input = { requestId: 'request-first', text: 'hello', bindThread: vi.fn() };
+
+    const first = runtime.startTurn(turnBinding('thread-1'), input);
+    const retry = runtime.startTurn(turnBinding('thread-1'), input);
+    opening.resolve();
+
+    await expect(retry).resolves.toEqual(await first);
+    expect(session.start).toHaveBeenCalledOnce();
+    expect(session.turn).toHaveBeenCalledOnce();
+  });
+
   it('deduplicates concurrent and accepted retries while rejecting another active turn', async () => {
     const pending = deferred();
     const { runtime, session } = await openTurnRuntime({ turn: () => pending.promise });
@@ -240,6 +310,19 @@ const approvalFrame = (id = 91) => ({
   params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', command: 'pwd', cwd: '/workspace' },
 });
 
+const projectionTool = (id, status) => ({
+  kind: 'part.upsert',
+  part: {
+    id: `prt_codex_${id}`,
+    sessionID: 'session-1',
+    messageID: 'msg_codex_turn-1',
+    type: 'tool',
+    callID: id,
+    tool: id.startsWith('command') ? 'bash' : id.startsWith('edit') ? 'apply_patch' : 'read',
+    state: { status, input: {}, time: { start: 1 } },
+  },
+});
+
 describe('CodexRuntime approval ownership', () => {
   it('projects one pending approval and atomically emits one response across concurrent retries', async () => {
     const pending = deferred();
@@ -286,6 +369,140 @@ describe('CodexRuntime approval ownership', () => {
 });
 
 describe('CodexRuntime authoritative session memory', () => {
+  it('reads one terminal working-tree snapshot when command execution emits no file event', async () => {
+    const projectedDiff = [{ file: 'fixture.txt', status: 'modified', patch: '@@ -1 +1 @@\n-BASELINE\n+WU12_EDIT' }];
+    const readWorkingTreeDiff = vi.fn(async () => projectedDiff);
+    const { runtime, emitNotification } = await openTurnRuntime({ readWorkingTreeDiff });
+    await runtime.startTurn(turnBinding('thread-1'), {
+      requestId: 'turn-request', text: 'edit', bindThread: vi.fn(),
+    });
+    emitNotification({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: { id: 'command-1', type: 'commandExecution', status: 'completed' },
+      },
+    });
+
+    await emitNotification({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    });
+
+    expect(readWorkingTreeDiff).toHaveBeenCalledOnce();
+    expect(readWorkingTreeDiff).toHaveBeenCalledWith('/workspace');
+    expect(runtime.projectionSnapshot('session-1')).toMatchObject({
+      status: 'idle', activeTurn: null, diff: projectedDiff, failure: null,
+    });
+    const terminal = runtime.replay('session-1', 2).events.at(-1);
+    expect(terminal.changes.map((change) => change.kind)).toEqual([
+      'session.diff', 'message.upsert', 'turn.changed', 'session.status',
+    ]);
+  });
+
+  it('publishes explicit failure when the terminal working-tree snapshot cannot be read', async () => {
+    const readWorkingTreeDiff = vi.fn(async () => { throw new Error('private Git failure'); });
+    const { runtime, emitNotification } = await openTurnRuntime({ readWorkingTreeDiff });
+    await runtime.startTurn(turnBinding('thread-1'), {
+      requestId: 'turn-request', text: 'edit', bindThread: vi.fn(),
+    });
+
+    await emitNotification({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    });
+
+    expect(runtime.projectionSnapshot('session-1')).toMatchObject({
+      status: 'failed', activeTurn: null,
+      failure: { code: 'diff-read-failed', message: 'Codex working-tree projection failed' },
+    });
+  });
+
+  it('publishes validated notifications through one contiguous projection authority', async () => {
+    let notify;
+    const broadcasts = [];
+    const session = createSession();
+    const runtime = new CodexRuntime({
+      createSession: ({ onNotification }) => { notify = onNotification; return session; },
+      broadcastProjection: (envelope, options) => broadcasts.push({ envelope, options }),
+      readWorkingTreeDiff: async () => [],
+      idleMs: 60_000,
+    });
+    await runtime.open('session-1', '/workspace');
+
+    notify({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1', startedAt: 1 } } });
+    notify({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'text-1', delta: 'hello' },
+    });
+    notify({ method: 'future/event', params: { privatePayload: 'discarded' } });
+    notify({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'text-1', delta: ' world' },
+    });
+    await notify({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', startedAt: 1, completedAt: 2 } },
+    });
+
+    expect(runtime.projectionSnapshot('session-1')).toMatchObject({
+      engine: 'codex', sessionID: 'session-1', revision: 4, status: 'idle', activeTurn: null,
+      messages: [{ id: 'msg_codex_turn-1', finish: 'completed' }],
+      parts: [{ id: 'prt_codex_text-1', text: 'hello world' }],
+    });
+    expect(broadcasts.map(({ envelope }) => envelope.revision)).toEqual([1, 2, 3, 4]);
+    expect(broadcasts[3].options).toEqual({ directory: '/workspace' });
+    expect(runtime.getProjectionMetrics()).toMatchObject({ translated: 4, rejected: 1, published: 4 });
+  });
+
+  it('rejects malformed or caller-revisioned projection changes without creating gaps', async () => {
+    const { runtime } = await openRuntime();
+
+    expect(() => runtime.publishProjection('session-1', { revision: 20, changes: [] }))
+      .toThrowError(expect.objectContaining({ code: 'invalid-projection' }));
+    expect(() => runtime.publishProjection('session-1', [{ kind: 'part.delta', partID: 'part-1' }]))
+      .toThrowError(expect.objectContaining({ code: 'invalid-projection' }));
+    runtime.publishProjection('session-1', [{ kind: 'session.status', status: 'running' }]);
+    runtime.publishProjection('session-1', [{ kind: 'session.status', status: 'idle' }]);
+
+    expect(runtime.projectionSnapshot('session-1').revision).toBe(2);
+    expect(runtime.replay('session-1', 0).events.map((event) => event.revision)).toEqual([1, 2]);
+  });
+
+  it('keeps committed projection truth and reports a broadcaster failure', async () => {
+    const session = createSession();
+    const runtime = new CodexRuntime({
+      createSession: () => session,
+      broadcastProjection: () => { throw new Error('transport unavailable'); },
+      idleMs: 60_000,
+    });
+    await runtime.open('session-1', '/workspace');
+
+    const published = runtime.publishProjection('session-1', [{ kind: 'session.status', status: 'failed' }]);
+
+    expect(published).toMatchObject({ applied: true, revision: 1, broadcastFailed: true });
+    expect(runtime.projectionSnapshot('session-1')).toMatchObject({ revision: 1, status: 'failed' });
+    expect(runtime.replay('session-1', 0)).toMatchObject({ kind: 'events', toRevision: 1 });
+    expect(runtime.getProjectionMetrics()).toMatchObject({ published: 1, broadcastFailures: 1 });
+  });
+
+  it('bounds projection replay and requires a snapshot after overflow', async () => {
+    const session = createSession();
+    const runtime = new CodexRuntime({ createSession: () => session, idleMs: 60_000, maxReplayEvents: 2 });
+    await runtime.open('session-1', '/workspace');
+    for (const status of ['running', 'waiting_approval', 'idle']) {
+      runtime.publishProjection('session-1', [{ kind: 'session.status', status }]);
+    }
+
+    expect(runtime.replay('session-1', 1)).toMatchObject({
+      kind: 'events', fromRevision: 1, toRevision: 3,
+      events: [{ revision: 2 }, { revision: 3 }],
+    });
+    expect(runtime.replay('session-1', 0)).toMatchObject({
+      kind: 'snapshot-required', snapshot: { revision: 3, status: 'idle' },
+    });
+  });
+
   it('keeps a newer event authoritative when a stale snapshot arrives later', async () => {
     const { runtime } = await openRuntime();
     runtime.applySnapshot('session-1', {
@@ -342,9 +559,9 @@ describe('CodexRuntime authoritative session memory', () => {
       fromRevision: 2,
       toRevision: 5,
       events: [
-        { revision: 3, event: { type: 'transcript.append', item: { id: 'message-3' } } },
-        { revision: 4, event: { type: 'transcript.append', item: { id: 'message-4' } } },
-        { revision: 5, event: { type: 'transcript.append', item: { id: 'message-5' } } },
+        { engine: 'codex', sessionID: 'session-1', revision: 3, changes: [{ kind: 'session.status', status: 'idle' }] },
+        { engine: 'codex', sessionID: 'session-1', revision: 4, changes: [{ kind: 'session.status', status: 'idle' }] },
+        { engine: 'codex', sessionID: 'session-1', revision: 5, changes: [{ kind: 'session.status', status: 'idle' }] },
       ],
     });
     expect(runtime.replay('session-1', 1)).toMatchObject({ kind: 'snapshot-required', snapshot: { revision: 5 } });
