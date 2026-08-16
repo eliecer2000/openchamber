@@ -5,6 +5,9 @@ export interface PermissionRequest {
   patterns: string[];
   metadata: Record<string, unknown>;
   always: string[];
+  engine?: 'codex';
+  threadID?: string;
+  turnID?: string;
   tool?: {
     messageID: string;
     callID: string;

@@ -12,6 +12,7 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     sessionGoalRuntime,
     contextObligatoryRuntime,
     scheduledTasksRuntime,
+    getCodexRoutesRuntime = () => null,
     getHealthCheckInterval,
     clearHealthCheckInterval,
     getTerminalRuntime,
@@ -48,6 +49,11 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     sessionGoalRuntime?.stop?.();
     contextObligatoryRuntime?.stop?.();
     scheduledTasksRuntime?.stop?.();
+    try {
+      await getCodexRoutesRuntime()?.shutdown?.();
+    } catch {
+      console.warn('Error shutting down Codex runtime');
+    }
 
     const healthCheckInterval = getHealthCheckInterval();
     if (healthCheckInterval) {

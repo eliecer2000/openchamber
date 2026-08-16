@@ -20,6 +20,11 @@ const globalUpsertedSessions: unknown[] = []
 const globalRemovedSessionIds: string[] = []
 const deletedCleanupIdentities: Array<{ runtimeKey: string; directory: string; sessionId: string }> = []
 const movedSessionDirectories: Array<{ sessionID: string; directory: string }> = []
+const codexReplyCalls: Array<Record<string, unknown>> = []
+const codexAbortCalls: Array<Record<string, unknown>> = []
+const codexPromptCalls: Array<Record<string, unknown>> = []
+let codexAbortError: Error | null = null
+let codexPromptError: Error | null = null
 
 const mockScopedClient = {
   permission: {
@@ -163,6 +168,23 @@ mock.module("@/lib/opencode/client", () => ({
   },
 }))
 
+mock.module("@/lib/codex/client", () => ({
+  replyToCodexApproval: mock((input: Record<string, unknown>) => {
+    codexReplyCalls.push(input)
+    return Promise.resolve({ requestId: input.requestId, decision: input.decision, revision: 4, pendingApprovals: [] })
+  }),
+  abortCodexTurn: mock((input: Record<string, unknown>) => {
+    codexAbortCalls.push(input)
+    if (codexAbortError) return Promise.reject(codexAbortError)
+    return Promise.resolve({ outcome: "interrupted", status: "idle", revision: 5 })
+  }),
+  startCodexTurn: mock((input: Record<string, unknown>) => {
+    codexPromptCalls.push(input)
+    if (codexPromptError) return Promise.reject(codexPromptError)
+    return Promise.resolve({ requestId: input.requestId, threadId: "thread-1", turnId: "turn-1", revision: 1 })
+  }),
+}))
+
 // Mock useConfigStore
 mock.module("@/stores/useConfigStore", () => ({
   useConfigStore: {
@@ -287,6 +309,82 @@ function createChildStores(entries: Array<[string, StoreApi<DirectoryStore>]>) {
     getChild: (dir: string) => new Map(entries).get(dir),
   } as unknown as import("./child-store").ChildStoreManager
 }
+
+describe("abortCurrentOperation engine routing", () => {
+  beforeEach(() => {
+    replyCalls.length = 0
+    codexAbortCalls.length = 0
+    codexAbortError = null
+  })
+
+  test("routes Codex abort explicitly and never calls the OpenCode SDK", async () => {
+    const store = createStore({}, {
+      session: [{ id: "ses_codex_one", directory: "/test/project" } as Session],
+    })
+    const { abortCurrentOperation, setActionRefs } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, createChildStores([["/test/project", store]]), () => "/other/project")
+
+    await abortCurrentOperation("ses_codex_one")
+
+    expect(codexAbortCalls).toEqual([{ sessionId: "ses_codex_one", directory: "/test/project" }])
+    expect(replyCalls.filter((call) => call.method === "session.abort")).toEqual([])
+  })
+
+  test("preserves the exact OpenCode abort path and surfaces Codex failures", async () => {
+    const store = createStore({}, {
+      session: [
+        { id: "session-a", directory: "/test/project" } as Session,
+        { id: "ses_codex_failed", directory: "/test/project" } as Session,
+      ],
+    })
+    const { abortCurrentOperation, setActionRefs } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, createChildStores([["/test/project", store]]), () => "/other/project")
+
+    await abortCurrentOperation("session-a")
+    expect(replyCalls.filter((call) => call.method === "session.abort")).toEqual([{
+      method: "session.abort", params: { sessionID: "session-a", directory: "/test/project" },
+    }])
+    codexAbortError = new Error("Codex interrupt failed")
+    await expect(abortCurrentOperation("ses_codex_failed")).rejects.toThrow("Codex interrupt failed")
+  })
+})
+
+describe("sendCodexPrompt execution routing", () => {
+  beforeEach(() => {
+    codexPromptCalls.length = 0
+    codexPromptError = null
+  })
+
+  test("deduplicates concurrent submit retries and sends no provider/model fields", async () => {
+    const { getRuntimeKey } = await import("@/lib/runtime-switch")
+    const { sendCodexPrompt } = await import("./session-actions")
+    const input = {
+      runtimeKey: getRuntimeKey(),
+      sessionId: "ses_codex_1",
+      directory: "/test/project",
+      text: "hello",
+    }
+
+    const [first, second] = await Promise.all([sendCodexPrompt(input), sendCodexPrompt(input)])
+
+    expect(first).toEqual(second)
+    expect(codexPromptCalls).toHaveLength(1)
+    expect(Object.keys(codexPromptCalls[0]).sort()).toEqual(["directory", "requestId", "sessionId", "text"])
+  })
+
+  test("rejects stale runtime submissions before reaching Codex", async () => {
+    const { getRuntimeKey } = await import("@/lib/runtime-switch")
+    const { sendCodexPrompt } = await import("./session-actions")
+
+    await expect(sendCodexPrompt({
+      runtimeKey: `${getRuntimeKey()}-stale`,
+      sessionId: "ses_codex_1",
+      directory: "/test/project",
+      text: "hello",
+    })).rejects.toThrow("runtime changed")
+    expect(codexPromptCalls).toHaveLength(0)
+  })
+})
 
 describe("moveSessionToDirectory", () => {
   beforeEach(() => {
@@ -1284,6 +1382,33 @@ describe("respondToPermission passes directory", () => {
 
     expect(scopedClientDirectories).toContain("/event/project")
     expect(replyCalls[0].params.directory).toBe("/event/project")
+  })
+})
+
+describe("Codex permission replies stay outside OpenCode", () => {
+  beforeEach(() => {
+    replyCalls.length = 0
+    codexReplyCalls.length = 0
+  })
+
+  test("routes once/reject through the Codex client and rejects always", async () => {
+    const permission = {
+      id: "91", sessionID: "ses_codex_1", permission: "bash", patterns: [], metadata: {}, always: [],
+      engine: "codex", threadID: "thread-1", turnID: "turn-1",
+    } as PermissionRequest
+    const childStores = createChildStores([["/test/project", createStore({ "ses_codex_1": [permission] })]])
+    const { respondToCodexPermission, respondToPermission, setActionRefs } = await import("./session-actions")
+    setActionRefs(mockSdk as unknown as OpencodeClient, childStores, () => "/test/project")
+
+    await respondToCodexPermission(permission, "once")
+    await expect(respondToCodexPermission(permission, "always")).rejects.toThrow("always")
+    await expect(respondToPermission(permission.sessionID, permission.id, "once")).rejects.toThrow("Codex")
+
+    expect(codexReplyCalls).toEqual([{
+      sessionId: "ses_codex_1", directory: "/test/project", requestId: "91",
+      decision: "once", threadId: "thread-1", turnId: "turn-1",
+    }])
+    expect(replyCalls.filter((call) => call.method === "permission.reply")).toHaveLength(0)
   })
 })
 

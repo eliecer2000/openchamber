@@ -62,6 +62,7 @@ import {
   shareSession as shareSessionAction,
   unshareSession as unshareSessionAction,
   optimisticSend,
+  sendCodexPrompt,
   refetchSessionMessages,
   revertToMessage as revertToMessageAction,
   unrevertSession as unrevertSessionAction,
@@ -78,6 +79,8 @@ import { setSessionGoal } from "@/lib/sessionGoalActions"
 import { wrapSystemReminder } from "@/lib/systemReminder"
 import { useUIStore } from "@/stores/useUIStore"
 import { useSelectionStore } from "./selection-store"
+import { createCodexSession } from "@/lib/codex/client"
+import type { ExecutionTarget, OpenCodeExecutionTarget } from "@/types/execution-target"
 import { getViewportSessionMemory, useViewportStore, viewportSessionKey } from "./viewport-store"
 import { useSessionWorktreeStore } from "./session-worktree-store"
 import { getAttachedSessionDirectory } from "./session-worktree-contract"
@@ -126,8 +129,9 @@ export function routeMessage(params: {
   sessionId: string
   directory?: string | null
   content: string
-  providerID: string
-  modelID: string
+  providerID?: string
+  modelID?: string
+  executionTarget?: ExecutionTarget
   agent?: string
   agentMentionName?: string
   variant?: string
@@ -137,13 +141,32 @@ export function routeMessage(params: {
   delivery?: 'steer'
 }): Promise<void> {
   const requestDirectory = params.directory ?? undefined
+  const executionTarget = params.executionTarget ?? (
+    params.providerID && params.modelID
+      ? { harnessId: "opencode" as const, providerID: params.providerID, modelID: params.modelID, agent: params.agent, variant: params.variant }
+      : null
+  )
+  if (!executionTarget) return Promise.reject(new Error("OpenCode provider and model are required"))
+  if (executionTarget.harnessId === "codex") {
+    if (!requestDirectory) return Promise.reject(new Error("Codex prompt directory is unavailable"))
+    if (params.inputMode === "shell" || params.files?.length || params.additionalParts?.length || params.delivery) {
+      return Promise.reject(new Error("Codex execution does not support this prompt payload"))
+    }
+    return sendCodexPrompt({
+      runtimeKey: params.runtimeKey ?? getRuntimeKey(),
+      sessionId: params.sessionId,
+      directory: requestDirectory,
+      text: params.content,
+    }).then(() => undefined)
+  }
+  const openCodeTarget: OpenCodeExecutionTarget = executionTarget
   if (params.inputMode === "shell") {
     return opencodeClient.shellSession({
       runtimeKey: params.runtimeKey,
       sessionId: params.sessionId,
       directory: requestDirectory,
       agent: params.agent ?? "",
-      model: { providerID: params.providerID, modelID: params.modelID },
+      model: { providerID: openCodeTarget.providerID, modelID: openCodeTarget.modelID },
       command: params.content,
     }).then(() => undefined)
   }
@@ -171,16 +194,16 @@ export function routeMessage(params: {
         runtimeKey: params.runtimeKey,
         sessionId: params.sessionId,
         content: params.content,
-        providerID: params.providerID,
-        modelID: params.modelID,
+        providerID: openCodeTarget.providerID,
+        modelID: openCodeTarget.modelID,
         agent: params.agent,
         directory: requestDirectory,
         files: params.files,
         send: (messageID) => opencodeClient.sendCommand({
           runtimeKey: params.runtimeKey,
           id: params.sessionId,
-          providerID: params.providerID,
-          modelID: params.modelID,
+          providerID: openCodeTarget.providerID,
+          modelID: openCodeTarget.modelID,
           command: cmdName,
           arguments: tail.join(" "),
           agent: params.agent,
@@ -198,16 +221,16 @@ export function routeMessage(params: {
     runtimeKey: params.runtimeKey,
     sessionId: params.sessionId,
     content: params.content,
-    providerID: params.providerID,
-    modelID: params.modelID,
+    providerID: openCodeTarget.providerID,
+    modelID: openCodeTarget.modelID,
     agent: params.agent,
     directory: requestDirectory,
     files: params.files,
     send: (messageID) => opencodeClient.sendMessage({
       runtimeKey: params.runtimeKey,
       id: params.sessionId,
-      providerID: params.providerID,
-      modelID: params.modelID,
+      providerID: openCodeTarget.providerID,
+      modelID: openCodeTarget.modelID,
       text: params.content,
       agent: params.agent,
       agentMentions: params.agentMentionName ? [{ name: params.agentMentionName }] : undefined,
@@ -234,6 +257,7 @@ type SendMessageOptions = {
   /** Immutable copy of the new-session draft at submit time; used instead of the live draft. */
   draftSnapshot?: NewSessionDraftState
   delivery?: 'steer'
+  executionTarget?: ExecutionTarget
 }
 
 type AssistantMessageSessionExecution = {
@@ -335,8 +359,8 @@ export type SessionUIState = {
   // Actions — SDK-calling operations (read domain data from sync-refs)
   sendMessage: (
     content: string,
-    providerID: string,
-    modelID: string,
+    providerID: string | undefined,
+    modelID: string | undefined,
     agent?: string,
     attachments?: AttachedFile[],
     agentMentionName?: string,
@@ -603,19 +627,20 @@ const waitForWorktreeBootstrapIfConfigured = async (directory: string | null, pr
   }
 }
 
-export async function materializeOpenDraftSession(selection: {
+export async function materializeOpenDraftSession(selection: ({
   providerID: string
   modelID: string
   agent?: string
   variant?: string
-}, draftOverride?: NewSessionDraftState): Promise<MaterializedDraftSession | null> {
+} & { harnessId?: 'opencode' }) | ExecutionTarget, draftOverride?: NewSessionDraftState): Promise<MaterializedDraftSession | null> {
   const store = useSessionUIStore.getState()
   const draft = draftOverride ?? store.newSessionDraft
   if (!draft?.open) return null
   const draftPermissionAutoAcceptEnabled = draft.permissionAutoAcceptEnabled === true
 
-  const trimmedAgent = typeof selection.agent === "string" && selection.agent.trim().length > 0
-    ? selection.agent.trim()
+  const openCodeSelection = selection.harnessId === "codex" ? null : selection
+  const trimmedAgent = typeof openCodeSelection?.agent === "string" && openCodeSelection.agent.trim().length > 0
+    ? openCodeSelection.agent.trim()
     : undefined
   let draftDirectoryOverride = draft.bootstrapPendingDirectory ?? draft.directoryOverride ?? null
   const draftProjectId = draft.selectedProjectId ?? null
@@ -626,6 +651,14 @@ export async function materializeOpenDraftSession(selection: {
   }
 
   await waitForWorktreeBootstrapIfConfigured(draftDirectoryOverride, draftProjectId)
+
+  if (selection.harnessId === "codex") {
+    if (!draftDirectoryOverride) throw new Error("Codex session directory is unavailable")
+    const created = await createCodexSession({ directory: draftDirectoryOverride })
+    useSelectionStore.getState().saveSessionExecutionHarness(created.sessionId, "codex")
+    store.setCurrentSession(created.sessionId, created.directory)
+    return { sessionId: created.sessionId, directory: created.directory }
+  }
 
   const created = await store.createSession(draft.title, draftDirectoryOverride, draft.parentID ?? null)
   if (!created?.id) throw new Error("Failed to create session")
@@ -649,6 +682,7 @@ export async function materializeOpenDraftSession(selection: {
 
   const effectiveDraftAgent = trimmedAgent ?? configState.currentAgentName
 
+  useSelectionStore.getState().saveSessionExecutionHarness(created.id, "opencode")
   useSelectionStore.getState().saveSessionModelSelection(created.id, selection.providerID, selection.modelID)
 
   if (effectiveDraftAgent) {
@@ -722,6 +756,10 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
   setCurrentSession: (id, directoryHint?: string | null) => {
     if (id) {
       get().closeNewSessionDraft()
+      useSelectionStore.getState().saveSessionExecutionHarness(
+        id,
+        id.startsWith("ses_codex_") ? "codex" : "opencode",
+      )
     }
 
     const key = runtimeMemoryKey()
@@ -824,6 +862,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       worktreeMetadata: new Map(get().worktreeMetadata),
       availableWorktreesByProject: new Map(get().availableWorktreesByProject),
     })
+    useSelectionStore.getState().resetExecutionTargets()
   },
 
   restoreForRuntimeSwitch: (apiBaseUrl?: string | null) => {
@@ -870,6 +909,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
     if (!options?.automatic) {
       clearLastActiveSession(runtimeMemoryKey())
     }
+    useSelectionStore.getState().setDraftExecutionHarness("opencode")
     const projectsState = useProjectsStore.getState()
     const projects = projectsState.projects
     const availableWorktreesByProject = get().availableWorktreesByProject
@@ -1200,8 +1240,8 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
   // a failed metadata patch must not fail the send.
   sendMessage: async (
     content: string,
-    providerID: string,
-    modelID: string,
+    providerID: string | undefined,
+    modelID: string | undefined,
     agent?: string,
     attachments?: AttachedFile[],
     agentMentionName?: string,
@@ -1214,6 +1254,12 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
     if (capturedTarget && capturedTarget.runtimeKey !== getRuntimeKey()) {
       throw new Error("Message was not sent because the runtime changed.")
     }
+    const executionTarget = options?.executionTarget ?? (
+      providerID && modelID
+        ? { harnessId: "opencode" as const, providerID, modelID, agent, variant }
+        : null
+    )
+    if (!executionTarget) throw new Error("OpenCode provider and model are required")
 
     // Clear non-Git changed-files bar on new user message for current session
     const sid = capturedTarget?.sessionId ?? options?.sessionId ?? get().currentSessionId;
@@ -1276,12 +1322,12 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
 
     // ---- New session from draft ----
     if (!capturedTarget && !options?.sessionId && draft?.open) {
-      const createdDraftSession = await materializeOpenDraftSession({
-        providerID,
-        modelID,
-        agent: trimmedAgent,
-        variant,
-      }, options?.draftSnapshot)
+      const createdDraftSession = await materializeOpenDraftSession(
+        executionTarget.harnessId === "opencode"
+          ? { ...executionTarget, agent: trimmedAgent }
+          : executionTarget,
+        options?.draftSnapshot,
+      )
       if (!createdDraftSession) throw new Error("Failed to create session")
 
       const mergedAdditionalParts = createdDraftSession.syntheticParts?.length
@@ -1304,8 +1350,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
         sessionId: createdDraftSession.sessionId,
         directory: createdDraftSession.directory,
         content,
-        providerID,
-        modelID,
+        executionTarget,
         agent: createdDraftSession.agent,
         agentMentionName,
         variant,
@@ -1335,13 +1380,17 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
     const effectiveAgent = trimmedAgent || sessionAgentSelection || configAgentName || undefined
 
     if (targetSessionId) {
-      useSelectionStore.getState().saveSessionModelSelection(targetSessionId, providerID, modelID)
+      useSelectionStore.getState().saveSessionExecutionHarness(targetSessionId, executionTarget.harnessId)
     }
 
-    if (targetSessionId && effectiveAgent) {
+    if (targetSessionId && executionTarget.harnessId === "opencode") {
+      useSelectionStore.getState().saveSessionModelSelection(targetSessionId, executionTarget.providerID, executionTarget.modelID)
+    }
+
+    if (targetSessionId && effectiveAgent && executionTarget.harnessId === "opencode") {
       useSelectionStore.getState().saveSessionAgentSelection(targetSessionId, effectiveAgent)
-      useSelectionStore.getState().saveAgentModelForSession(targetSessionId, effectiveAgent, providerID, modelID)
-      useSelectionStore.getState().saveAgentModelVariantForSession(targetSessionId, effectiveAgent, providerID, modelID, variant)
+      useSelectionStore.getState().saveAgentModelForSession(targetSessionId, effectiveAgent, executionTarget.providerID, executionTarget.modelID)
+      useSelectionStore.getState().saveAgentModelVariantForSession(targetSessionId, effectiveAgent, executionTarget.providerID, executionTarget.modelID, executionTarget.variant)
     }
 
     if (targetSessionId) {
@@ -1387,8 +1436,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       sessionId: targetSessionId || "",
       directory: currentSessionDirectory,
       content,
-      providerID,
-      modelID,
+      executionTarget,
       agent: effectiveAgent,
       agentMentionName,
       variant,

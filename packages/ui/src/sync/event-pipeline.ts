@@ -20,6 +20,7 @@ import { type RelayTunnelWebSocket } from "@/lib/relay/tunnel-client"
 import { openRuntimeWebSocket } from "@/lib/relay/runtime-socket"
 import { syncDebug } from "./debug"
 import { countSyncPerformance } from "./performance-diagnostics"
+import type { CodexProjectionChange, CodexProjectionEvent } from "./event-reducer"
 
 const FLUSH_FRAME_MS = 33
 const BACKPRESSURE_FLUSH_FRAME_MS = 200
@@ -39,6 +40,74 @@ const RETRY_BACKOFF_BASE_MS = 250
 const RETRY_BACKOFF_CAP_VISIBLE_MS = 5_000
 const RETRY_BACKOFF_CAP_HIDDEN_OR_OFFLINE_MS = 60_000
 const RETRY_BACKOFF_MAX_EXPONENT = 8
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+
+const parseCodexChange = (value: unknown): CodexProjectionChange | null => {
+  if (!isRecord(value) || typeof value.kind !== "string") return null
+  if (value.kind === "message.upsert" || value.kind === "message.error") {
+    return isRecord(value.message) && typeof value.message.id === "string" ? value as CodexProjectionChange : null
+  }
+  if (value.kind === "part.upsert") {
+    return isRecord(value.part) && typeof value.part.id === "string" && typeof value.part.messageID === "string"
+      ? value as CodexProjectionChange : null
+  }
+  if (value.kind === "part.delta") {
+    return typeof value.messageID === "string" && typeof value.partID === "string"
+      && (value.field === "text" || value.field === "output") && typeof value.delta === "string"
+      ? value as CodexProjectionChange : null
+  }
+  if (value.kind === "tool.output.delta") {
+    return typeof value.messageID === "string" && typeof value.partID === "string" && typeof value.delta === "string"
+      ? value as CodexProjectionChange : null
+  }
+  if (value.kind === "session.status") {
+    return ["starting", "running", "waiting_approval", "interrupting", "idle", "failed"].includes(String(value.status))
+      ? value as CodexProjectionChange : null
+  }
+  if (value.kind === "session.diff") return Array.isArray(value.diff) ? value as CodexProjectionChange : null
+  if (value.kind === "approval.pending") {
+    return isRecord(value.approval) && typeof value.approval.id === "string" ? value as CodexProjectionChange : null
+  }
+  return null
+}
+
+export function orderCodexProjectionEvents(
+  values: readonly unknown[],
+  afterRevision: Readonly<Record<string, number>> = {},
+): { events: CodexProjectionEvent[]; revisions: Record<string, number>; rejected: number } {
+  const candidates: CodexProjectionEvent[] = []
+  let rejected = 0
+  for (const value of values) {
+    if (!isRecord(value) || value.engine !== "codex" || typeof value.sessionID !== "string"
+      || !Number.isSafeInteger(value.revision) || Number(value.revision) <= 0 || !Array.isArray(value.changes)) {
+      rejected += 1
+      continue
+    }
+    const changes = value.changes.map(parseCodexChange).filter((change): change is CodexProjectionChange => change !== null)
+    if (changes.length === 0) {
+      rejected += 1
+      continue
+    }
+    candidates.push({ engine: "codex", sessionID: value.sessionID, revision: Number(value.revision), changes })
+  }
+
+  candidates.sort((left, right) => left.revision - right.revision)
+  const revisions = { ...afterRevision }
+  const events: CodexProjectionEvent[] = []
+  for (const event of candidates) {
+    const current = revisions[event.sessionID] ?? 0
+    if (event.revision <= current) {
+      rejected += 1
+      continue
+    }
+    revisions[event.sessionID] = event.revision
+    events.push(event)
+  }
+  return { events, revisions, rejected }
+}
+
 type EventPipelineDelivery = {
   onEvent: (directory: string, payload: Event) => void
   onEvents?: never

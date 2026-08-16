@@ -49,6 +49,8 @@ This module provides OpenCode server integration utilities for the web server ru
 - `packages/web/server/lib/opencode/shared.js`: shared utilities for config, markdown, skills, and git helpers.
 - `packages/web/server/lib/ui-auth/ui-auth.js`: UI session authentication runtime (outside OpenCode module).
 - `packages/web/server/lib/ui-auth/ui-passkeys.js`: UI passkey storage and WebAuthn registration/authentication helpers (outside OpenCode module).
+- `packages/web/server/lib/codex/routes.js`: Web Server-only Codex capability/session reads, deduplicated turn starts, exactly-once approval replies, and scoped idempotent abort with frozen launch eligibility; registered after API auth and before the generic OpenCode proxy.
+- `packages/web/server/lib/codex/event-translator.js`: explicit Codex 0.147.0 notification/request translation into revisioned, engine-tagged UI projections; malformed and unknown frames retain no raw payload.
 
 ## Public exports (auth.js)
 - `readAuthFile()`: Reads and parses `~/.local/share/opencode/auth.json`.
@@ -312,9 +314,11 @@ Transport-triggered health checks share the periodic monitor's failure accountin
   - `setupProxy(app)`
 
 ## Public exports (shutdown-runtime.js)
-- `createGracefulShutdownRuntime(dependencies)`: creates graceful shutdown runtime for managed OpenCode and web server teardown sequencing.
+- `createGracefulShutdownRuntime(dependencies)`: creates graceful shutdown runtime for Codex sessions, managed OpenCode, and web server teardown sequencing.
 - Returned API:
   - `gracefulShutdown(options?)`
+
+Codex abort ownership remains inside `CodexRuntime`: one atomic transition clears active-turn and approval ownership, terminalizes running tool items, sends `turn/interrupt`, and ignores late activity. Interrupt or process failure remains `failed` and triggers retryable app-server cleanup instead of publishing idle success.
 
 ## Public exports (server-startup-runtime.js)
 - `createServerStartupRuntime(dependencies)`: creates runtime for server bind/startup tunnel and process handler wiring.
@@ -329,7 +333,7 @@ Transport-triggered health checks share the periodic monitor's failure accountin
   - `registerStaticRoutes(app)`
 
 ## Public exports (feature-routes-runtime.js)
-- `createFeatureRoutesRuntime(dependencies)`: creates runtime for main feature route registration orchestration.
+- `createFeatureRoutesRuntime(dependencies)`: creates runtime for main feature route registration orchestration, including Codex routes before OpenCode proxy fallback.
 - Returned API:
   - `registerRoutes(app, routeDependencies)`
 

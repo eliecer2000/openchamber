@@ -123,6 +123,46 @@ describe('CodexAppServerSession', () => {
       vi.useRealTimers();
     }
   });
+
+  it('forwards server approval requests and sends explicit decisions', async () => {
+    const child = createChild();
+    const onRequest = vi.fn();
+    const session = new CodexAppServerSession({ directory: '/workspace', spawn: () => child, onRequest });
+    await session.start();
+    const approval = { id: 91, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', command: 'pwd', cwd: '/workspace',
+    } };
+
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify(approval)}\n`));
+    session.respond(91, { decision: 'decline' });
+
+    expect(onRequest).toHaveBeenCalledWith(approval);
+    expect(child.frames.at(-1)).toEqual({ id: 91, result: { decision: 'decline' } });
+    await session.shutdown();
+  });
+
+  it('sends an authoritative turn interrupt and retries cleanup after a partial failure', async () => {
+    const child = createChild();
+    const originalKill = child.kill;
+    let failCleanup = true;
+    child.kill = (signal) => {
+      if (failCleanup) {
+        failCleanup = false;
+        throw new Error('temporary cleanup failure');
+      }
+      return originalKill(signal);
+    };
+    const session = new CodexAppServerSession({ directory: '/workspace', spawn: () => child });
+    await session.start();
+
+    await expect(session.interrupt('thread-1', 'turn-1')).resolves.toEqual({ ok: true });
+    expect(child.frames.at(-1)).toMatchObject({
+      method: 'turn/interrupt', params: { threadId: 'thread-1', turnId: 'turn-1' },
+    });
+    await expect(session.shutdown()).rejects.toThrow('temporary cleanup failure');
+    await expect(session.shutdown()).resolves.toBeUndefined();
+    expect(session.state).toBe('closed');
+  });
 });
 
 describe('CodexRuntime lifecycle ownership', () => {

@@ -104,6 +104,7 @@ import { createSystemPromptRuntime } from './lib/system-prompt/runtime.js';
 import { createOpenChamberSessionService } from './lib/openchamber-sessions/routes.js';
 import { createScheduledTaskService } from './lib/scheduled-tasks/service.js';
 import { createOpenChamberControlService } from './lib/openchamber-control/service.js';
+import { createCodexRoutesRuntime } from './lib/codex/routes.js';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -512,6 +513,7 @@ let runtimeManagedRemoteTunnelHostname = '';
 let terminalRuntime = null;
 let dictationRuntime = null;
 let messageStreamRuntime = null;
+let codexRoutesRuntime = null;
 const userProvidedOpenCodePassword = hmrStateRuntime.getUserProvidedOpenCodePassword(hmrState);
 const initialOpenCodeAuthState = hmrStateRuntime.resolveOpenCodeAuthFromState({
   hmrState,
@@ -1184,6 +1186,7 @@ const scheduledTaskService = createScheduledTaskService({
   sanitizeProjects,
   projectConfigRuntime,
   scheduledTasksRuntime,
+  getCodexRoutesRuntime: () => codexRoutesRuntime,
 });
 const openChamberSessionService = createOpenChamberSessionService({
   readSettingsFromDiskMigrated,
@@ -1524,6 +1527,13 @@ async function main(options = {}) {
   // runtime's active port). The pairing routes registered here only read the
   // relay candidate lazily at request time, so a late-bound holder is enough.
   let relayServiceInstance = null;
+  codexRoutesRuntime = createCodexRoutesRuntime({
+    runtimeName: process.env.OPENCHAMBER_RUNTIME || 'web',
+    apiOnly,
+    dataDirectory: OPENCHAMBER_DATA_DIR,
+    getServerId: () => relayServiceInstance?.getServerId?.() ?? null,
+    resolveProjectDirectory,
+  });
 
   // Same pattern for the tunnel runtime: created after the base routes so
   // /api/system/info resolves port + tunnel URL lazily at request time.
@@ -1753,6 +1763,7 @@ async function main(options = {}) {
     getOpenChamberEventClients: () => uiOpenChamberEventClients,
     writeSseEvent,
     permissionAutoAcceptRuntime,
+    codexRoutesRuntime,
   });
 
   const startupPipelineResult = await startupPipelineRuntime.run({

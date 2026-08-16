@@ -27,6 +27,7 @@ export class CodexAppServerSession {
     shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
     stderrLimitBytes = DEFAULT_STDERR_LIMIT_BYTES,
     onExit = () => {},
+    onRequest = () => {},
   }) {
     if (!path.isAbsolute(directory)) throw new TypeError('Codex app-server directory must be absolute');
     this.directory = directory;
@@ -37,6 +38,7 @@ export class CodexAppServerSession {
     this.shutdownTimeoutMs = shutdownTimeoutMs;
     this.stderrLimitBytes = stderrLimitBytes;
     this.onExit = onExit;
+    this.onRequest = onRequest;
     this.state = 'new';
     this.stderrBytes = 0;
     this.stderrTruncated = false;
@@ -75,6 +77,7 @@ export class CodexAppServerSession {
           child.stdin.write(frame);
         },
         onProtocolError: (error) => this.handleProtocolFailure(error),
+        onRequest: (request) => this.onRequest(request),
       });
       child.stdout?.on('data', (chunk) => this.client.push(chunk));
       await this.client.request('initialize', {
@@ -99,6 +102,20 @@ export class CodexAppServerSession {
   turn(method, params) {
     this.assertReady();
     return this.client.request(method, params);
+  }
+
+  interrupt(threadId, turnId) {
+    return this.control('turn/interrupt', { threadId, turnId });
+  }
+
+  respond(id, result) {
+    this.assertReady();
+    this.client.respond(id, result);
+  }
+
+  respondError(id, error) {
+    this.assertReady();
+    this.client.respondError(id, error);
   }
 
   assertReady() {
@@ -133,7 +150,10 @@ export class CodexAppServerSession {
 
   shutdown() {
     if (this.shutdownPromise) return this.shutdownPromise;
-    this.shutdownPromise = this.performShutdown();
+    this.shutdownPromise = this.performShutdown().catch((error) => {
+      this.shutdownPromise = null;
+      throw error;
+    });
     return this.shutdownPromise;
   }
 

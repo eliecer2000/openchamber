@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { Event, OpencodeClient } from "@opencode-ai/sdk/v2/client"
-import { createEventPipeline } from "./event-pipeline"
+import { createEventPipeline, orderCodexProjectionEvents } from "./event-pipeline"
 
 const failAfter = (ms: number) => new Promise<never>((_, reject) => {
   setTimeout(() => reject(new Error("Timed out waiting for event pipeline flush")), ms)
@@ -68,6 +68,29 @@ function createSdk(events: Event[], streamFinished: () => void): OpencodeClient 
 }
 
 describe("createEventPipeline", () => {
+  test("orders Codex revisions and drops duplicates, stale, unknown, and malformed changes independently", () => {
+    const valid = (sessionID: string, revision: number, value: string) => ({
+      engine: "codex",
+      sessionID,
+      revision,
+      changes: [{ kind: "session.status", status: value }],
+    })
+    const result = orderCodexProjectionEvents([
+      valid("ses_a", 4, "idle"),
+      valid("ses_a", 2, "running"),
+      valid("ses_a", 4, "failed"),
+      valid("ses_b", 1, "running"),
+      { engine: "codex", sessionID: "ses_b", revision: 2, changes: [{ kind: "future.shape" }] },
+      { engine: "codex", sessionID: "ses_b", revision: 3, changes: [{ kind: "session.status", status: "idle" }, null] },
+      { engine: "other", sessionID: "ses_a", revision: 5, changes: [] },
+    ], { ses_a: 2 });
+
+    expect(result.events.map((event) => `${event.sessionID}:${event.revision}`)).toEqual(["ses_b:1", "ses_b:3", "ses_a:4"])
+    expect(result.events[1]?.changes).toEqual([{ kind: "session.status", status: "idle" }])
+    expect(result.revisions).toEqual({ ses_a: 4, ses_b: 3 })
+    expect(result.rejected).toBe(4)
+  })
+
   test("delivers one ordered batch per directory flush", async () => {
     let resolveStreamFinished!: () => void
     const streamFinished = new Promise<void>((resolve) => {

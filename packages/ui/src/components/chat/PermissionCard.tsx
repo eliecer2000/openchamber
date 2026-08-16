@@ -9,7 +9,7 @@ import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Icon } from "@/components/icon/Icon";
 import { DiffPreview, WritePreview } from './DiffPreview';
 import { useI18n } from '@/lib/i18n';
-import { getVisiblePermissionPatterns } from './permissionCardPatterns';
+import { supportsAlwaysPermissionResponse, getVisiblePermissionPatterns } from './permissionCardPatterns';
 
 const PERMISSION_BASH_CUSTOM_STYLE: React.CSSProperties = {
   margin: 0,
@@ -96,6 +96,7 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
   const [isResponding, setIsResponding] = React.useState(false);
   const [hasResponded, setHasResponded] = React.useState(false);
   const respondToPermission = sessionActions.respondToPermission;
+  const respondToCodexPermission = sessionActions.respondToCodexPermission;
   const sessions = useSessions();
   const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
   const isFromSubagent = React.useMemo(() => {
@@ -108,7 +109,8 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
     setIsResponding(true);
 
     try {
-      await respondToPermission(permission.sessionID, permission.id, response);
+      if (permission.engine === 'codex') await respondToCodexPermission(permission, response);
+      else await respondToPermission(permission.sessionID, permission.id, response);
       setHasResponded(true);
       onResponse?.(response);
     } catch (error) {
@@ -374,7 +376,7 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
               Allow Once
             </button>
 
-            {permission.always.length > 0 ? (
+            {supportsAlwaysPermissionResponse(permission) && (permission.always.length > 0 ? (
               <button
                 onClick={() => handleResponse('always')}
                 disabled={isResponding}
@@ -429,7 +431,7 @@ export const PermissionCard: React.FC<PermissionCardProps> = ({
                 <Icon name="time" className="h-3.5 w-3.5 sm:h-3 sm:w-3 flex-shrink-0" />
                 Always Allow
               </button>
-            )}
+            ))}
 
             <button
               onClick={() => handleResponse('reject')}

@@ -35,6 +35,8 @@ import { getStaleRunningToolMessageID } from "./materialization"
 import { normalizePath } from "@/lib/pathNormalization"
 import { mergeMessages } from "./optimistic"
 import { messagesBefore, messagesFrom } from "./message-ordering"
+import { abortCodexTurn, replyToCodexApproval, startCodexTurn } from "@/lib/codex/client"
+import type { PermissionRequest } from "@/types/permission"
 
 const MESSAGE_REFETCH_LIMIT = 100
 const SEND_CONFIRMATION_REFETCH_LIMIT = 30
@@ -52,6 +54,38 @@ const SEND_CONFIRMATION_RECONNECT_POLL_MS = 100
 const MESSAGE_REFETCH_SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const UNREVERT_REFETCH_ATTEMPTS = 3
 const UNREVERT_REFETCH_RETRY_MS = 150
+
+const codexPromptClaims = new Map<string, { text: string; promise: ReturnType<typeof startCodexTurn> }>()
+
+export function sendCodexPrompt(input: {
+  runtimeKey: string
+  sessionId: string
+  directory: string
+  text: string
+}): ReturnType<typeof startCodexTurn> {
+  if (input.runtimeKey !== getRuntimeKey()) {
+    return Promise.reject(new Error("Message was not sent because the runtime changed."))
+  }
+  const key = JSON.stringify([input.runtimeKey, input.directory, input.sessionId])
+  const prior = codexPromptClaims.get(key)
+  if (prior) {
+    if (prior.text !== input.text) {
+      return Promise.reject(new Error("Codex session already has a prompt submission in progress"))
+    }
+    return prior.promise
+  }
+  const requestId = crypto.randomUUID()
+  const promise = startCodexTurn({
+    sessionId: input.sessionId,
+    directory: input.directory,
+    requestId,
+    text: input.text,
+  }).finally(() => {
+    if (codexPromptClaims.get(key)?.promise === promise) codexPromptClaims.delete(key)
+  })
+  codexPromptClaims.set(key, { text: input.text, promise })
+  return promise
+}
 
 // Reference set by SyncProvider — allows actions to access SDK and stores
 let _sdk: OpencodeClient | null = null
@@ -1534,6 +1568,11 @@ export async function abortCurrentOperation(sessionId: string): Promise<void> {
   // (the "stop button does nothing" report — sessions in another project/
   // worktree than the UI's current directory could never be aborted).
   const { directory } = dirStoreForSession(sessionId)
+  if (sessionId.startsWith("ses_codex_")) {
+    if (!directory) throw new Error("Codex abort directory is unavailable")
+    await abortCodexTurn({ sessionId, directory })
+    return
+  }
   try {
     await sdk().session.abort({ sessionID: sessionId, directory })
   } catch (error) {
@@ -1551,6 +1590,9 @@ export async function respondToPermission(
   response: "once" | "always" | "reject",
   directoryOverride?: string,
 ): Promise<void> {
+  if (sessionId.startsWith("ses_codex_")) {
+    throw new Error("Codex permission replies must use the Codex approval route")
+  }
   await waitForConnectionOrThrow()
   const directory = directoryOverride
     || resolveDirectoryForBlockingRequest("permission", sessionId, requestId)
@@ -1567,6 +1609,28 @@ export async function respondToPermission(
   if (assertSdkData(result, "permission.reply") !== true) {
     throw new Error("Permission reply failed")
   }
+}
+
+export async function respondToCodexPermission(
+  permission: PermissionRequest,
+  response: "once" | "always" | "reject",
+): Promise<void> {
+  if (permission.engine !== "codex" || !permission.threadID || !permission.turnID) {
+    throw new Error("Codex approval scope is invalid")
+  }
+  if (response === "always") throw new Error("Codex approvals do not support always")
+  const directory = resolveDirectoryForBlockingRequest("permission", permission.sessionID, permission.id)
+    || getSessionDirectory(permission.sessionID)
+    || dir()
+  if (!directory) throw new Error("Codex approval directory is unavailable")
+  await replyToCodexApproval({
+    sessionId: permission.sessionID,
+    directory,
+    requestId: permission.id,
+    decision: response,
+    threadId: permission.threadID,
+    turnId: permission.turnID,
+  })
 }
 
 export async function dismissPermission(

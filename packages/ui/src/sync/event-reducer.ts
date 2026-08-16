@@ -181,6 +181,23 @@ export type DirectoryEventResult = boolean | {
   }
 }
 
+export type CodexProjectionChange =
+  | { kind: "message.upsert"; message: Message }
+  | { kind: "message.error"; message: Message }
+  | { kind: "part.upsert"; part: Part }
+  | { kind: "part.delta"; messageID: string; partID: string; field: "text" | "output"; delta: string }
+  | { kind: "tool.output.delta"; messageID: string; partID: string; delta: string }
+  | { kind: "session.status"; status: "starting" | "running" | "waiting_approval" | "interrupting" | "idle" | "failed" }
+  | { kind: "session.diff"; diff: FileDiff[] }
+  | { kind: "approval.pending"; approval: PermissionRequest }
+
+export type CodexProjectionEvent = {
+  engine: "codex"
+  sessionID: string
+  revision: number
+  changes: readonly CodexProjectionChange[]
+}
+
 function hasMessage(draft: State, sessionID: string | undefined, messageID: string): boolean {
   if (!sessionID) return false
   const messages = draft.message[sessionID]
@@ -207,6 +224,153 @@ export function applyGlobalProject(state: GlobalState, project: Project): Global
     projects.splice(result.index, 0, project)
   }
   return { ...state, projects }
+}
+
+export function applyCodexProjectionEvents(
+  draft: State,
+  events: readonly CodexProjectionEvent[],
+  currentRevisions: Readonly<Record<string, number>>,
+): { changed: boolean; revisions: Record<string, number> } {
+  const messageBuckets = new Map<string, { messages: Message[]; mutable: boolean }>()
+  const partBuckets = new Map<string, { parts: Part[]; index: Map<string, number>; mutable: boolean }>()
+  const getMessages = (sessionID: string) => {
+    let bucket = messageBuckets.get(sessionID)
+    if (!bucket) {
+      bucket = { messages: draft.message[sessionID] ?? [], mutable: false }
+      messageBuckets.set(sessionID, bucket)
+    }
+    return bucket
+  }
+  const mutableMessages = (sessionID: string) => {
+    const bucket = getMessages(sessionID)
+    if (!bucket.mutable) {
+      bucket.messages = [...bucket.messages]
+      bucket.mutable = true
+      draft.message[sessionID] = bucket.messages
+    }
+    return bucket.messages
+  }
+  const getParts = (messageID: string) => {
+    let bucket = partBuckets.get(messageID)
+    if (!bucket) {
+      const parts = draft.part[messageID] ?? []
+      bucket = { parts, index: new Map(parts.map((part, index) => [part.id, index])), mutable: false }
+      partBuckets.set(messageID, bucket)
+    }
+    return bucket
+  }
+  const mutableParts = (messageID: string) => {
+    const bucket = getParts(messageID)
+    if (!bucket.mutable) {
+      bucket.parts = [...bucket.parts]
+      bucket.mutable = true
+      draft.part[messageID] = bucket.parts
+    }
+    return bucket
+  }
+
+  let changed = false
+  const revisions = { ...currentRevisions }
+  for (const event of events) {
+    if (event.revision <= (revisions[event.sessionID] ?? 0)) continue
+    revisions[event.sessionID] = event.revision
+    for (const change of event.changes) {
+    if (change.kind === "message.upsert" || change.kind === "message.error") {
+      const current = getMessages(event.sessionID).messages
+      const index = findMessageIndex(current, change.message.id)
+      if (index >= 0) {
+        if (!areJsonEquivalent(current[index], change.message)) {
+          const messages = mutableMessages(event.sessionID)
+          messages[index] = change.message
+          changed = true
+        }
+      } else {
+        const messages = mutableMessages(event.sessionID)
+        insertMessageChronologically(messages, change.message)
+        changed = true
+      }
+      continue
+    }
+    if (change.kind === "part.upsert") {
+      const messageID = (change.part as { messageID: string }).messageID
+      const current = getParts(messageID)
+      const index = current.index.get(change.part.id)
+      if (index === undefined) {
+        const bucket = mutableParts(messageID)
+        bucket.index.set(change.part.id, bucket.parts.length)
+        bucket.parts.push(change.part)
+        changed = true
+      } else if (!areJsonEquivalent(current.parts[index], change.part)) {
+        // A partial delta may synthesize an empty starter after a richer part
+        // already exists; never regress that authoritative content.
+        const existing = current.parts[index] as Record<string, unknown>
+        const incoming = change.part as Record<string, unknown>
+        if (!(incoming.text === "" && typeof existing.text === "string" && existing.text.length > 0)) {
+          const bucket = mutableParts(messageID)
+          bucket.parts[index] = change.part
+          changed = true
+        }
+      }
+      continue
+    }
+    if (change.kind === "part.delta" || change.kind === "tool.output.delta") {
+      const bucket = mutableParts(change.messageID)
+      const index = bucket.index.get(change.partID)
+      if (index === undefined) continue
+      const part = bucket.parts[index] as unknown as Record<string, unknown>
+      if (change.kind === "part.delta") {
+        bucket.parts[index] = { ...part, [change.field]: `${part[change.field] ?? ""}${change.delta}` } as unknown as Part
+      } else {
+        const state = isObjectRecord(part.state) ? part.state : {}
+        bucket.parts[index] = { ...part, state: { ...state, output: `${state.output ?? ""}${change.delta}` } } as unknown as Part
+      }
+      changed = true
+      continue
+    }
+    if (change.kind === "session.status") {
+      const status = ["starting", "running", "waiting_approval", "interrupting"].includes(change.status)
+        ? { type: "busy" } as const : { type: "idle" } as const
+      if (!areSessionStatusesEqual(draft.session_status[event.sessionID], status)) {
+        draft.session_status[event.sessionID] = status
+        changed = true
+      }
+      continue
+    }
+    if (change.kind === "session.diff") {
+      if (!areJsonEquivalent(draft.session_diff[event.sessionID], change.diff)) {
+        draft.session_diff[event.sessionID] = change.diff
+        changed = true
+      }
+      continue
+    }
+    const permissions = draft.permission[event.sessionID] ?? []
+    const index = permissions.findIndex((permission) => permission.id === change.approval.id)
+    if (index < 0 || !areJsonEquivalent(permissions[index], change.approval)) {
+      const next = [...permissions]
+      if (index < 0) next.push(change.approval)
+      else next[index] = change.approval
+      draft.permission[event.sessionID] = next
+      changed = true
+    }
+    }
+  }
+  return { changed, revisions }
+}
+
+export function applyCodexProjectionEvent(
+  draft: State,
+  event: CodexProjectionEvent,
+  currentRevision: number,
+): { changed: boolean; revision: number; reason?: "stale-revision" } {
+  if (event.revision <= currentRevision) {
+    return { changed: false, revision: currentRevision, reason: "stale-revision" }
+  }
+  const result = applyCodexProjectionEvents(draft, [event], { [event.sessionID]: currentRevision })
+  return { changed: result.changed, revision: result.revisions[event.sessionID] ?? currentRevision }
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,7 @@ export interface ComposerFooterProps {
     permissionAutoAcceptEnabled: boolean;
     isPermissionAutoAcceptInteractive: boolean;
     dictationActive: boolean;
+    showModelControls: boolean;
 
     onOpenSettings?: () => void;
     onPickLocalFiles: () => void;
@@ -90,6 +91,7 @@ export function ComposerFooter(props: ComposerFooterProps) {
         permissionAutoAcceptEnabled,
         isPermissionAutoAcceptInteractive,
         dictationActive,
+        showModelControls,
         onOpenSettings,
         onPickLocalFiles,
         onOpenIssuePicker,
@@ -226,7 +228,7 @@ export function ComposerFooter(props: ComposerFooterProps) {
                         <SessionGoalObjectiveCounter length={messageLength} />
                     </div>
                     <div className={cn('flex items-center flex-1 justify-end', footerGapClass, 'md:gap-x-3')}>
-                        <MemoModelControls className={cn('flex-1 min-w-0 justify-end')} />
+                        {showModelControls ? <MemoModelControls className={cn('flex-1 min-w-0 justify-end')} /> : null}
                         <MemoComposerDictation
                             radius={chatInputRadius}
                             isMobile={isMobile}

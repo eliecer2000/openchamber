@@ -7,6 +7,10 @@ everything between typing and sending.
 own state and wires these modules together; it should not grow logic that
 belongs to one of them.
 
+The composer captures one explicit execution target at submit time. OpenCode
+retains its provider/model send contract; Web-only Codex drafts use the
+authenticated Codex client and never enter that OpenCode path.
+
 ## Layers
 
 | Directory | Owns |

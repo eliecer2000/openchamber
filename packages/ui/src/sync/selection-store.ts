@@ -6,6 +6,7 @@
 import { create } from "zustand"
 import { persist } from "zustand/middleware"
 import { createDeferredSafeJSONStorage } from "@/stores/utils/safeStorage"
+import type { ExecutionHarnessId } from "@/types/execution-target"
 
 type ModelSelection = { providerId: string; modelId: string }
 type LastUsedProvider = { providerID: string; modelID: string }
@@ -22,6 +23,8 @@ export type SelectionState = {
   sessionAgentSelections: Map<string, string>
   sessionAgentModelSelections: Map<string, Map<string, ModelSelection>>
   lastUsedProvider: LastUsedProvider | null
+  draftExecutionHarness: ExecutionHarnessId
+  sessionExecutionHarnesses: Map<string, ExecutionHarnessId>
 
   saveSessionModelSelection: (sessionId: string, providerId: string, modelId: string) => void
   getSessionModelSelection: (sessionId: string) => { providerId: string; modelId: string } | null
@@ -31,6 +34,9 @@ export type SelectionState = {
   getAgentModelForSession: (sessionId: string, agentName: string) => { providerId: string; modelId: string } | null
   saveAgentModelVariantForSession: (sessionId: string, agentName: string, providerId: string, modelId: string, variant: string | undefined) => void
   getAgentModelVariantForSession: (sessionId: string, agentName: string, providerId: string, modelId: string) => string | undefined
+  setDraftExecutionHarness: (harnessId: ExecutionHarnessId) => void
+  saveSessionExecutionHarness: (sessionId: string, harnessId: ExecutionHarnessId) => void
+  resetExecutionTargets: () => void
 }
 
 const isPersistedSelectionState = (state: unknown): state is PersistedSelectionState => (
@@ -50,6 +56,8 @@ export const useSelectionStore = create<SelectionState>()(
       sessionAgentSelections: new Map(),
       sessionAgentModelSelections: new Map(),
       lastUsedProvider: null,
+      draftExecutionHarness: 'opencode',
+      sessionExecutionHarnesses: new Map(),
 
       saveSessionModelSelection: (sessionId, providerId, modelId) =>
         set((s) => {
@@ -122,6 +130,26 @@ export const useSelectionStore = create<SelectionState>()(
         const key = `${providerId}/${modelId}`
         return agentModelVariantSelections.get(sessionId)?.get(agentName)?.get(key)
       },
+
+      setDraftExecutionHarness: (harnessId) =>
+        set((state) => state.draftExecutionHarness === harnessId
+          ? state
+          : { draftExecutionHarness: harnessId }),
+
+      saveSessionExecutionHarness: (sessionId, harnessId) =>
+        set((state) => {
+          if (state.sessionExecutionHarnesses.get(sessionId) === harnessId) return state
+          const next = new Map(state.sessionExecutionHarnesses)
+          next.delete(sessionId)
+          next.set(sessionId, harnessId)
+          if (next.size > MAX_PERSISTED_SESSIONS) next.delete(next.keys().next().value as string)
+          return { sessionExecutionHarnesses: next }
+        }),
+
+      resetExecutionTargets: () =>
+        set((state) => state.draftExecutionHarness === 'opencode' && state.sessionExecutionHarnesses.size === 0
+          ? state
+          : { draftExecutionHarness: 'opencode', sessionExecutionHarnesses: new Map() }),
     }),
     {
       name: "selection-store",

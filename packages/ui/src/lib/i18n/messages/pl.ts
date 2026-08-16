@@ -12,6 +12,11 @@ export const dict: Record<I18nKey, string> = {
   'chat.chatInput.prCommentContextRemove': 'Usuń kontekst komentarzy PR',
   'chat.chatInput.prCheckContext': 'Nieudane kontrole PR',
   'chat.chatInput.prCheckContextRemove': 'Usuń kontekst kontroli PR',
+  'chat.executionTarget.label': 'Cel wykonania',
+  'chat.executionTarget.openCode': 'OpenCode',
+  'chat.executionTarget.codex': 'Codex',
+  'chat.executionTarget.codexUnavailable': 'Codex jest niedostępny w tym środowisku.',
+  'chat.executionTarget.codexUnsupportedPayload': 'Codex obecnie obsługuje tylko polecenia tekstowe.',
 
   'common.loading': 'Ładowanie...',
   'common.unavailable': 'Niedostępne',

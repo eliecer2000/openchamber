@@ -125,7 +125,10 @@ export const createFeatureRoutesRuntime = (dependencies) => {
       writeSseEvent,
       emitSessionCreatedEvent,
       permissionAutoAcceptRuntime,
+      codexRoutesRuntime,
     } = routeDependencies;
+
+    codexRoutesRuntime.registerRoutes(app);
 
     registerSettingsUtilityRoutes(app, {
       readCustomThemesFromDisk,

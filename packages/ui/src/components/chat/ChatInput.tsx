@@ -51,8 +51,10 @@ import { MobileAgentButton } from './MobileAgentButton';
 import { MobileModelButton } from './MobileModelButton';
 import { useCurrentSessionActivity } from '@/hooks/useSessionActivity';
 import { toast } from '@/components/ui';
+import { Button } from '@/components/ui/button';
 // useMessageStore removed — messages now come from sync system
 import { isVSCodeRuntime } from '@/lib/desktop';
+import { isCapacitorApp } from '@/lib/platform';
 import { useTabletLayout } from '@/lib/device';
 import { useHardwareKeyboard } from '@/lib/hardwareKeyboard';
 import { isIMECompositionEvent } from '@/lib/ime';
@@ -142,6 +144,12 @@ import { LinkedReferenceRow } from './composer/ui/LinkedReferenceRow';
 import { RevertedMessageDock } from './composer/ui/RevertedMessageDock';
 import { SessionSuggestionChip } from '@/components/chat/SessionSuggestionChip';
 import { SessionGoalRow } from '@/components/chat/SessionGoalRow';
+import { getCodexCapability } from '@/lib/codex/client';
+import {
+    isCodexSupportedSurface,
+    resolveExecutionTarget,
+    type ExecutionHarnessId,
+} from '@/types/execution-target';
 
 // Lazy like in ChatMessage: a static import would pull the @pierre/diffs and
 // Shiki stacks into the eager startup graph for a dialog opened on demand.
@@ -330,6 +338,14 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     const addAttachedFile = useInputStore((s) => s.addAttachedFile);
     const clearAttachedFiles = useInputStore((s) => s.clearAttachedFiles);
     const saveSessionAgentSelection = useSelectionStore((s) => s.saveSessionAgentSelection);
+    const selectedExecutionHarness = useSelectionStore(React.useCallback(
+        (state) => currentSessionId
+            ? state.sessionExecutionHarnesses.get(currentSessionId)
+                ?? (currentSessionId.startsWith('ses_codex_') ? 'codex' : 'opencode')
+            : state.draftExecutionHarness,
+        [currentSessionId],
+    ));
+    const setDraftExecutionHarness = useSelectionStore((s) => s.setDraftExecutionHarness);
     const consumePendingInputText = useInputStore((s) => s.consumePendingInputText);
     const pendingPresetSubmit = useInputStore((s) => s.pendingPresetSubmit);
     const setPendingInputText = useInputStore((s) => s.setPendingInputText);
@@ -368,7 +384,34 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     const isExpandedInput = useUIStore((state) => state.isExpandedInput);
     const setExpandedInput = useUIStore((state) => state.setExpandedInput);
     const setTimelineDialogOpen = useUIStore((state) => state.setTimelineDialogOpen);
-    const { git: runtimeGit, vscode: vscodeApi } = useRuntimeAPIs();
+    const runtimeApis = useRuntimeAPIs();
+    const { git: runtimeGit, vscode: vscodeApi } = runtimeApis;
+    const codexSurfaceSupported = isCodexSupportedSurface({
+        platform: runtimeApis.runtime.platform,
+        isDesktop: runtimeApis.runtime.isDesktop,
+        isVSCode: runtimeApis.runtime.isVSCode,
+        isMobile,
+        isCapacitor: isCapacitorApp(),
+    });
+    const [codexAvailable, setCodexAvailable] = React.useState(false);
+    React.useEffect(() => {
+        let cancelled = false;
+        if (!codexSurfaceSupported) {
+            setCodexAvailable(false);
+            if (!currentSessionId) setDraftExecutionHarness('opencode');
+            return () => { cancelled = true; };
+        }
+        void getCodexCapability().then((capability) => {
+            if (cancelled || activeRuntimeKey !== getRuntimeKey()) return;
+            setCodexAvailable(capability.available);
+            if (!capability.available && !currentSessionId) setDraftExecutionHarness('opencode');
+        }).catch(() => {
+            if (cancelled) return;
+            setCodexAvailable(false);
+            if (!currentSessionId) setDraftExecutionHarness('opencode');
+        });
+        return () => { cancelled = true; };
+    }, [activeRuntimeKey, codexSurfaceSupported, currentSessionId, setDraftExecutionHarness]);
     const cycleAgentShortcutOverride = useUIStore((state) => state.shortcutOverrides.cycle_agent);
     const cycleAgentShortcut = React.useMemo(() => (
         getEffectiveShortcutCombo('cycle_agent', cycleAgentShortcutOverride ? { cycle_agent: cycleAgentShortcutOverride } : undefined)
@@ -889,7 +932,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     // Add message to queue instead of sending
     const handleQueueMessage = React.useCallback(() => {
         const inputSnapshot = getCurrentInputSnapshot();
-        if (!inputSnapshot.hasContent || !currentSessionId || !messageQueueTarget) return;
+        if (!inputSnapshot.hasContent || !currentSessionId || !messageQueueTarget || selectedExecutionHarness === 'codex') return;
 
         const drafts = inlineDraftTarget ? consumeDrafts(inlineDraftTarget) : [];
 
@@ -922,7 +965,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         if (!isMobile) {
             composerRef.current?.focus();
         }
-    }, [getCurrentInputSnapshot, currentSessionId, messageQueueTarget, inlineDraftTarget, attachedFiles, sanitizeAttachmentsForSend, addToQueue, clearAttachedFiles, isMobile, consumeDrafts, currentProviderId, currentModelId, currentAgentName, currentVariant]);
+    }, [getCurrentInputSnapshot, currentSessionId, messageQueueTarget, inlineDraftTarget, attachedFiles, sanitizeAttachmentsForSend, addToQueue, clearAttachedFiles, isMobile, consumeDrafts, currentProviderId, currentModelId, currentAgentName, currentVariant, selectedExecutionHarness]);
 
     const handleQueuedMessageEdit = React.useCallback((content: string) => {
         setMessage(content);
@@ -999,9 +1042,23 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         const modelIdToSend = capturedSendConfig?.modelID ?? currentModelId;
         const agentNameToSend = capturedSendConfig?.agent ?? currentAgentName;
         const variantToSend = capturedSendConfig?.variant ?? currentVariant;
-
-        if (!providerIdToSend || !modelIdToSend) {
+        let executionTarget;
+        try {
+            executionTarget = resolveExecutionTarget({
+                sessionId: currentSessionId,
+                draftOpen: newSessionDraftOpen,
+                selectedHarnessId: queuedOnly ? 'opencode' : selectedExecutionHarness,
+                providerID: providerIdToSend,
+                modelID: modelIdToSend,
+                agent: agentNameToSend,
+                variant: variantToSend,
+            });
+        } catch {
             console.warn('Cannot send message: provider or model not selected');
+            return;
+        }
+        if (executionTarget.harnessId === 'codex' && !codexAvailable) {
+            toast.error(t('chat.executionTarget.codexUnavailable'));
             return;
         }
 
@@ -1014,12 +1071,12 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         // queued-message auto-send hook delivers it as the next turn once the
         // rejected turn winds down and the session returns to idle. This avoids
         // aborting the turn (which would surface an "aborted" notice).
-        if (currentSessionId && !queuedOnly && autoReviewRunning) {
+        if (executionTarget.harnessId === 'opencode' && currentSessionId && !queuedOnly && autoReviewRunning) {
             handleQueueMessage();
             return;
         }
 
-        if (currentSessionId && !queuedOnly) {
+        if (executionTarget.harnessId === 'opencode' && currentSessionId && !queuedOnly) {
             // Sending is authoritative for blocking prompts: deny pending
             // permissions and dismiss open questions for the session subtree,
             // then queue the message once if either was open. The deny/clear
@@ -1043,13 +1100,13 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
             target?: NonNullable<typeof capturedTarget>;
             draftSnapshot?: NonNullable<typeof capturedDraftSnapshot>;
             delivery?: 'steer';
-        } | undefined = (capturedTarget || capturedDraftSnapshot || delivery)
-            ? {
+            executionTarget?: typeof executionTarget;
+        } = {
                 ...(capturedTarget ? { target: capturedTarget } : {}),
                 ...(capturedDraftSnapshot ? { draftSnapshot: capturedDraftSnapshot } : {}),
                 ...(delivery ? { delivery } : {}),
-            }
-            : undefined;
+                executionTarget,
+            };
 
         // Inline review comments and synthetic context are consumed before
         // assembly so a failed send can restore exactly what it took.
@@ -1118,7 +1175,9 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         }
 
         // Local slash commands, normal mode only.
-        const parsedCommand = inputMode === 'normal' ? parseSlashCommand(primaryText) : null;
+        const parsedCommand = executionTarget.harnessId === 'opencode' && inputMode === 'normal'
+            ? parseSlashCommand(primaryText)
+            : null;
         if (parsedCommand) {
             const { name: commandName, argument } = parsedCommand;
 
@@ -1187,7 +1246,8 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         }
 
         const currentSessionDirectory = capturedTarget?.directory ?? currentDirectory;
-        const shouldAddResponseStyle = newSessionDraftOpen || (currentSessionId ? !hasUserMessages(currentSessionId, currentSessionDirectory) : false);
+        const shouldAddResponseStyle = executionTarget.harnessId === 'opencode' &&
+            (newSessionDraftOpen || (currentSessionId ? !hasUserMessages(currentSessionId, currentSessionDirectory) : false));
         if (shouldAddResponseStyle) {
             const responseStyleInstruction = await fetchResponseStyleInstruction().catch(() => null);
             if (responseStyleInstruction) {
@@ -1214,10 +1274,19 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
             ...additionalParts.flatMap(p => p.attachments ?? []),
         ];
 
+        if (executionTarget.harnessId === 'codex' &&
+            (inputMode === 'shell' || allAttachments.length > 0 || additionalParts.length > 0 || delivery)) {
+            if (consumedDraftTarget && drafts.length > 0) {
+                useInlineCommentDraftStore.getState().restoreDrafts(consumedDraftTarget, drafts);
+            }
+            toast.error(t('chat.executionTarget.codexUnsupportedPayload'));
+            return;
+        }
+
         const sendPromise = sendMessage(
             primaryText,
-            providerIdToSend,
-            modelIdToSend,
+            executionTarget.harnessId === 'opencode' ? executionTarget.providerID : undefined,
+            executionTarget.harnessId === 'opencode' ? executionTarget.modelID : undefined,
             agentNameToSend,
             primaryAttachments,
             agentMentionName,
@@ -1357,7 +1426,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     // Primary action for send/queue button — respects selected follow-up behavior
     const handlePrimaryAction = React.useCallback(() => {
         const inputSnapshot = getCurrentInputSnapshot();
-        const canQueue = inputMode === 'normal' && inputSnapshot.hasContent && currentSessionId && (sessionPhase !== 'idle' || autoReviewRunning);
+        const canQueue = selectedExecutionHarness === 'opencode' && inputMode === 'normal' && inputSnapshot.hasContent && currentSessionId && (sessionPhase !== 'idle' || autoReviewRunning);
         if (followUpBehavior === 'queue' && canQueue) {
             handleQueueMessage();
         } else if (followUpBehavior === 'steer' && canQueue) {
@@ -1365,7 +1434,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         } else {
             void handleSubmitRef.current();
         }
-    }, [inputMode, getCurrentInputSnapshot, currentSessionId, sessionPhase, autoReviewRunning, followUpBehavior, handleQueueMessage]);
+    }, [selectedExecutionHarness, inputMode, getCurrentInputSnapshot, currentSessionId, sessionPhase, autoReviewRunning, followUpBehavior, handleQueueMessage]);
 
     // Draft welcome presets: submit immediately.
     const submitPresetPrompt = React.useCallback((text: string, type: 'command' | 'skill') => {
@@ -1577,7 +1646,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
 
             // Queueing / steering only works when there's an existing busy
             // session (or an active auto-review run).
-            const canQueue = inputMode === 'normal' && hasContent && currentSessionId && (sessionPhase !== 'idle' || autoReviewRunning);
+            const canQueue = selectedExecutionHarness === 'opencode' && inputMode === 'normal' && hasContent && currentSessionId && (sessionPhase !== 'idle' || autoReviewRunning);
 
             if (followUpBehavior === 'queue') {
                 if (isCtrlEnter || !canQueue) {
@@ -2306,6 +2375,12 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     // panel, so these keep their place above the composer there.
     const composerStatusExtrasEnabled = isVSCode || isMobile;
     const showDraftTargetSelectors = newSessionDraftOpen && !isVSCode;
+    const codexExecutionActive = currentSessionId?.startsWith('ses_codex_') === true ||
+        (!currentSessionId && newSessionDraftOpen && selectedExecutionHarness === 'codex');
+    const showExecutionTargetSelector = newSessionDraftOpen && codexAvailable;
+    const selectExecutionHarness = React.useCallback((harnessId: ExecutionHarnessId) => {
+        setDraftExecutionHarness(harnessId);
+    }, [setDraftExecutionHarness]);
 
     // Which project and directory a new session will target.
     const {
@@ -2599,6 +2674,30 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                         onOpenPicker={setMobileDraftPicker}
                     />
                 ) : null}
+                {showExecutionTargetSelector ? (
+                    <div
+                        className="flex items-center gap-1 px-3 pb-1"
+                        role="group"
+                        aria-label={t('chat.executionTarget.label')}
+                    >
+                        <Button
+                            variant="chip"
+                            size="xs"
+                            aria-pressed={selectedExecutionHarness === 'opencode'}
+                            onClick={() => selectExecutionHarness('opencode')}
+                        >
+                            {t('chat.executionTarget.openCode')}
+                        </Button>
+                        <Button
+                            variant="chip"
+                            size="xs"
+                            aria-pressed={selectedExecutionHarness === 'codex'}
+                            onClick={() => selectExecutionHarness('codex')}
+                        >
+                            {t('chat.executionTarget.codex')}
+                        </Button>
+                    </div>
+                ) : null}
                 <div
                     // Desktop: layout-transparent. Mobile: positioning host for
                     // the wrapper-level dictation overlay across pill/full states.
@@ -2801,6 +2900,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                         permissionAutoAcceptEnabled={permissionAutoAcceptEnabled}
                         isPermissionAutoAcceptInteractive={isPermissionAutoAcceptInteractive}
                         dictationActive={mobileShell.dictationActive}
+                        showModelControls={!codexExecutionActive}
                         onOpenSettings={onOpenSettings}
                         onPickLocalFiles={handlePickLocalFiles}
                         onOpenIssuePicker={openIssuePicker}

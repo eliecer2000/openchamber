@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { Session } from "@opencode-ai/sdk/v2"
 import type { Event, Message, Part, PermissionRequest, QuestionRequest, SessionStatus } from "@opencode-ai/sdk/v2/client"
-import { applyDirectoryEvent } from "../event-reducer"
+import { applyCodexProjectionEvent, applyCodexProjectionEvents, applyDirectoryEvent } from "../event-reducer"
 import { INITIAL_STATE, type State } from "../types"
 
 function state(overrides: Partial<State> = {}): State {
@@ -65,6 +65,65 @@ function buildSession(title: string, time: Session["time"]): Session {
 }
 
 describe("applyDirectoryEvent", () => {
+  test("applies one Codex batch in order while preserving unrelated references", () => {
+    const otherMessages = [{ id: "msg_other", sessionID: "ses_other", role: "assistant", time: { created: 1 } } as Message]
+    const otherParts = [{ id: "prt_other", messageID: "msg_other", sessionID: "ses_other", type: "text", text: "safe" } as Part]
+    const draft = state({ message: { ses_other: otherMessages }, part: { msg_other: otherParts } })
+    const result = applyCodexProjectionEvents(draft, [{
+      engine: "codex",
+      sessionID: "ses_codex_1",
+      revision: 3,
+      changes: [
+        { kind: "message.upsert", message: { id: "msg_codex_turn-1", sessionID: "ses_codex_1", role: "assistant", time: { created: 1 } } as Message },
+        { kind: "part.upsert", part: { id: "prt_codex_text-1", messageID: "msg_codex_turn-1", sessionID: "ses_codex_1", type: "text", text: "" } as Part },
+        { kind: "part.delta", messageID: "msg_codex_turn-1", partID: "prt_codex_text-1", field: "text", delta: "hello" },
+        { kind: "part.upsert", part: { id: "prt_codex_cmd-1", messageID: "msg_codex_turn-1", sessionID: "ses_codex_1", type: "tool", callID: "cmd-1", tool: "bash", state: { status: "running", input: {}, time: { start: 1 } } } as Part },
+        { kind: "tool.output.delta", messageID: "msg_codex_turn-1", partID: "prt_codex_cmd-1", delta: "ok" },
+        { kind: "session.diff", diff: [{ file: "a.ts", patch: "@@ real @@" }] },
+        { kind: "session.status", status: "running" },
+      ],
+    }], { ses_codex_1: 2 })
+
+    expect(result).toEqual({ changed: true, revisions: { ses_codex_1: 3 } })
+    expect((draft.part["msg_codex_turn-1"][0] as { text: string }).text).toBe("hello")
+    expect((draft.part["msg_codex_turn-1"][1] as { state: { output: string } }).state.output).toBe("ok")
+    expect(draft.session_diff.ses_codex_1).toEqual([{ file: "a.ts", patch: "@@ real @@" }])
+    expect(draft.session_status.ses_codex_1).toEqual({ type: "busy" })
+    expect(draft.message.ses_other).toBe(otherMessages)
+    expect(draft.part.msg_other).toBe(otherParts)
+  })
+
+  test("rejects duplicate and stale Codex revisions without overwriting newer authoritative state", () => {
+    const messages = [{ id: "msg_codex_turn-1", sessionID: "ses_codex_1", role: "assistant", time: { created: 1 }, finish: "stop" } as Message]
+    const draft = state({ message: { ses_codex_1: messages }, session_status: { ses_codex_1: { type: "idle" } } })
+    const stale = { engine: "codex", sessionID: "ses_codex_1", revision: 4, changes: [{ kind: "session.status", status: "running" }] } as const
+
+    expect(applyCodexProjectionEvent(draft, stale, 5)).toEqual({ changed: false, revision: 5, reason: "stale-revision" })
+    expect(applyCodexProjectionEvent(draft, { ...stale, revision: 5 }, 5)).toEqual({ changed: false, revision: 5, reason: "stale-revision" })
+    expect(draft.message.ses_codex_1).toBe(messages)
+    expect(draft.session_status.ses_codex_1).toEqual({ type: "idle" })
+  })
+
+  test("keeps affected bucket references stable for semantic Codex no-ops", () => {
+    const message = { id: "msg_codex_turn-1", sessionID: "ses_codex_1", role: "assistant", time: { created: 1 } } as Message
+    const part = { id: "prt_codex_text-1", messageID: message.id, sessionID: message.sessionID, type: "text", text: "complete" } as Part
+    const messages = [message]
+    const parts = [part]
+    const draft = state({ message: { ses_codex_1: messages }, part: { [message.id]: parts } })
+
+    expect(applyCodexProjectionEvent(draft, {
+      engine: "codex",
+      sessionID: message.sessionID,
+      revision: 6,
+      changes: [
+        { kind: "message.upsert", message },
+        { kind: "part.upsert", part: { ...part, text: "" } as Part },
+      ],
+    }, 5)).toEqual({ changed: false, revision: 6 })
+    expect(draft.message.ses_codex_1).toBe(messages)
+    expect(draft.part[message.id]).toBe(parts)
+  })
+
   test("inserts post-rollover message events by creation time rather than ID", () => {
     const legacy = {
       id: "msg_ffffffffffffLegacy",
