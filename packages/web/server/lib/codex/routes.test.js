@@ -12,7 +12,7 @@ const createHarness = ({
   apiOnly = false,
   bindingStore = {},
   codexRuntime = {},
-  resolveProjectDirectory = async () => WORKSPACE,
+  resolveProjectDirectory = async () => ({ directory: WORKSPACE, error: null }),
 } = {}) => {
   const app = express();
   const proxy = vi.fn((_req, res) => res.status(599).json({ proxied: true }));
@@ -100,7 +100,7 @@ describe('Codex Web Server routes', () => {
     expect(proxy).toHaveBeenCalledTimes(1);
   });
 
-  it('uses frozen Web authority for session listing and creation', async () => {
+  it('uses frozen Web authority and production-shaped directory resolution for session listing and creation', async () => {
     const binding = { sessionId: SESSION_ID, directory: WORKSPACE, runtimeId: 'web', threadId: null };
     const bindingStore = {
       list: vi.fn(async () => [binding]),
@@ -130,6 +130,30 @@ describe('Codex Web Server routes', () => {
       authoritativeDirectory: WORKSPACE,
       runtimeId: 'web',
     });
+  });
+
+  it('keeps failed structured directory resolution private and rejects session creation', async () => {
+    const bindingStore = { create: vi.fn() };
+    const { app } = createHarness({
+      bindingStore,
+      resolveProjectDirectory: async () => ({
+        directory: null,
+        error: 'Access to /private/secret-workspace denied',
+      }),
+    });
+
+    const response = await request(app)
+      .post('/api/codex/sessions')
+      .set('Authorization', 'Bearer valid')
+      .send({ directory: WORKSPACE })
+      .expect(400);
+
+    expect(response.body).toEqual({
+      error: 'Codex project directory is required',
+      code: 'invalid-directory',
+    });
+    expect(JSON.stringify(response.body)).not.toContain('/private/secret-workspace');
+    expect(bindingStore.create).not.toHaveBeenCalled();
   });
 
   it('exposes only authoritative server memory for session, messages, and status reads', async () => {
@@ -189,7 +213,7 @@ describe('Codex Web Server routes', () => {
     const { app } = createHarness({
       bindingStore,
       codexRuntime,
-      resolveProjectDirectory: async () => 'relative/workspace',
+      resolveProjectDirectory: async () => ({ directory: 'relative/workspace', error: null }),
     });
     const auth = { Authorization: 'Bearer valid' };
 
@@ -199,7 +223,7 @@ describe('Codex Web Server routes', () => {
     const absolute = createHarness({
       bindingStore,
       codexRuntime,
-      resolveProjectDirectory: async () => WORKSPACE,
+      resolveProjectDirectory: async () => ({ directory: WORKSPACE, error: null }),
     });
     await request(absolute.app)
       .get(`/api/codex/sessions/${SESSION_ID}/messages?afterRevision=1.5`)

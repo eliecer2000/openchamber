@@ -241,7 +241,10 @@ export const createCodexEngineFixture = async () => {
       runtimeDescriptor: { runtimeName: 'web', apiOnly: false },
       bindingStore,
       codexRuntime: runtime,
-      resolveProjectDirectory: async (req) => canonicalWorkspace(req.body?.directory ?? req.query?.directory),
+      resolveProjectDirectory: async (req) => ({
+        directory: canonicalWorkspace(req.body?.directory ?? req.query?.directory),
+        error: null,
+      }),
     });
     const app = express();
     app.use(express.json({ limit: '64kb' }));

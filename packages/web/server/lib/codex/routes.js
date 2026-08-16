@@ -88,7 +88,8 @@ export const createCodexRoutesRuntime = ({
   };
 
   const resolveScope = async (req) => {
-    const authoritativeDirectory = await resolveProjectDirectory(req);
+    const resolution = await resolveProjectDirectory(req);
+    const authoritativeDirectory = resolution?.directory;
     if (typeof authoritativeDirectory !== 'string' || !path.isAbsolute(authoritativeDirectory)) {
       const error = new Error('Codex project directory is required');
       error.code = 'invalid-directory';
